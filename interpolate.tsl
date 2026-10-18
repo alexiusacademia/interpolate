@@ -1,0 +1,62 @@
+// interpolate: linear interpolation between two points.
+//
+// Given two known points of a straight-line relation, finds the x that goes
+// with a y between them (or beyond them), as when reading a value off a
+// table: the depth of water for a given discharge, the year a quantity
+// reaches a level, and so on.
+//
+// Author: Alexius Academia
+// Date: 2026-10-18
+
+// A point of the relation: an x and the y that goes with it.
+//
+// Fields:
+//   x: The point's x, the value `interpolate` finds.
+//   y: The point's y, the value `interpolate` is given.
+//
+// Example:
+//   let low = interpolate.Point(x: 10.0, y: 100.0)
+public struct Point {
+    x: Float,
+    y: Float
+}
+
+// The x on the straight line through `p1` and `p3` at height `y2`.
+//
+// The line through the two points gives
+//
+//   x2 = (x1 - x3) / (y1 - y3) * (y2 - y3) + x3
+//
+// so a `y2` halfway between `p1.y` and `p3.y` gives the x halfway between
+// `p1.x` and `p3.x`. A `y2` outside the two points extends the line
+// (extrapolation) rather than failing. The order of the points doesn't
+// matter.
+//
+// Parameters:
+//   p1: One known point (point 1).
+//   p3: The other known point (point 3).
+//   y2: The y of the point to find (point 2), usually between `p1.y` and
+//       `p3.y`.
+//
+// Returns:
+//   The x of point 2, a Float.
+//
+// Note:
+//   The two points must have different y's. If `p1.y == p3.y` the line is
+//   level, no single x has height `y2`, and the result is infinity (`inf`
+//   or `-inf`), or `NaN` when `y2` is that same height.
+//
+// Example:
+//   let a = interpolate.Point(x: 10.0, y: 100.0)
+//   let b = interpolate.Point(x: 20.0, y: 200.0)
+//   interpolate.interpolate(p1: a, p3: b, y2: 150.0)   // 15.0
+//   interpolate.interpolate(p1: a, p3: b, y2: 250.0)   // 25.0, beyond b
+public fn interpolate(p1: Point, p3: Point, y2: Float) -> Float {
+    let x1 = p1.x
+    let x3 = p3.x
+    let y1 = p1.y
+    let y3 = p3.y
+
+    let x2 = (x1 - x3) / (y1 - y3) * (y2 - y3) + x3
+    x2
+}
