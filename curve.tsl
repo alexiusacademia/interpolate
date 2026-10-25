@@ -1,0 +1,378 @@
+// interpolate: curves through many points. An Interpolant is a piecewise cubic
+// polynomial through a table of points (straight lines, splines, a curve
+// that keeps the data's shape, or Akima's), or steps, and it gives values,
+// slopes, areas and the x for a y. The ways to make one are in fit.tsl.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// What a curve gives outside the range of its points.
+public enum Outside {
+    // Goes on with the end pieces' own lines or curves (as SciPy does).
+    extend
+    // Keeps the end points' values: flat beyond them.
+    hold
+    // NaN: there's no value there.
+    nan
+}
+
+// Which point's value a step curve takes between two points.
+public enum Step {
+    // The point before (on the left).
+    previous
+    // The point after (on the right).
+    next
+    // The nearer point; halfway goes to the one before, as in SciPy.
+    nearest
+}
+
+// A curve through points: between xs[k] and xs[k + 1] it is
+//   ys[k] + b[k]·t + c[k]·t² + d[k]·t³,  t = x − xs[k],
+// or, for steps, flat. Make one with `linear`, `spline`, `monotone`,
+// `akima` or `steps`.
+public struct Interpolant {
+    xs: [Float]
+    ys: [Float]
+    b: [Float]
+    c: [Float]
+    d: [Float]
+    outside: Outside = .extend
+    isSteps: Bool = false
+    step: Step = .previous
+    // What made it: "linear", "spline", "monotone", "akima", "makima", "steps".
+    kind: String = ""
+
+    // The piece x falls in: the last k with xs[k] <= x, kept between 0 and
+    // the last piece.
+    fn piece(_ x: Float) -> Int {
+        let n = xs.count
+        if x <= xs[0] {
+            return 0
+        }
+        if x >= xs[n - 2] {
+            return n - 2
+        }
+        var lo = 0
+        var hi = n - 2
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2
+            if xs[mid] <= x {
+                lo = mid
+            } else {
+                hi = mid
+            }
+        }
+        lo
+    }
+
+    // Whether x is outside the points' range.
+    fn isOutside(_ x: Float) -> Bool {
+        x < xs[0] || x > xs[xs.count - 1]
+    }
+
+    // at(x)
+    //   The curve's value at x. Outside the points it extends, holds or
+    //   gives NaN, as the curve's `outside` says.
+    fn at(_ x: Float) -> Float {
+        if x.isNaN {
+            return x
+        }
+        let n = xs.count
+        var u = x
+        if isOutside(x) {
+            if outside == .nan {
+                return 0.0 / 0.0
+            }
+            if outside == .hold || isSteps {
+                return if x < xs[0] { ys[0] } else { ys[n - 1] }
+            }
+        }
+        if isSteps {
+            return stepValue(u)
+        }
+        let k = piece(u)
+        let t = u - xs[k]
+        ys[k] + t * (b[k] + t * (c[k] + t * d[k]))
+    }
+
+    // A step curve's value at x, inside the points' range.
+    fn stepValue(_ x: Float) -> Float {
+        let n = xs.count
+        if x >= xs[n - 1] {
+            return ys[n - 1]
+        }
+        let k = piece(x)
+        if step == .previous {
+            return if x >= xs[k + 1] { ys[k + 1] } else { ys[k] }
+        }
+        if step == .next {
+            return if x <= xs[k] { ys[k] } else { ys[k + 1] }
+        }
+        // Halfway goes to the point before; the halfway x is worked out as
+        // SciPy does, so a tie falls the same way.
+        if x <= (xs[k] + xs[k + 1]) / 2.0 { ys[k] } else { ys[k + 1] }
+    }
+
+    // values(xs)
+    //   The curve's value at each of `xs`.
+    fn values(_ at0: [Float]) -> [Float] {
+        var out: [Float] = []
+        for x in at0 {
+            out.append(at(x))
+        }
+        out
+    }
+
+    // slope(x)
+    //   How fast the curve rises at x: its first derivative. 0 where it's
+    //   held flat, and for steps.
+    fn slope(_ x: Float) -> Float {
+        if x.isNaN {
+            return x
+        }
+        if isOutside(x) {
+            if outside == .nan {
+                return 0.0 / 0.0
+            }
+            if outside == .hold {
+                return 0.0
+            }
+        }
+        if isSteps {
+            return 0.0
+        }
+        let k = piece(x)
+        let t = x - xs[k]
+        b[k] + t * (2.0 * c[k] + t * 3.0 * d[k])
+    }
+
+    // secondDerivative(x)
+    //   How fast the slope changes at x: the curve's bending.
+    fn secondDerivative(_ x: Float) -> Float {
+        if x.isNaN {
+            return x
+        }
+        if isOutside(x) {
+            if outside == .nan {
+                return 0.0 / 0.0
+            }
+            if outside == .hold {
+                return 0.0
+            }
+        }
+        if isSteps {
+            return 0.0
+        }
+        let k = piece(x)
+        let t = x - xs[k]
+        2.0 * c[k] + 6.0 * d[k] * t
+    }
+
+    // The area under piece k from its start to t along it.
+    fn pieceArea(_ k: Int, _ t: Float) -> Float {
+        t * (ys[k] + t * (b[k] / 2.0 + t * (c[k] / 3.0 + t * d[k] / 4.0)))
+    }
+
+    // integral(from:, to:)
+    //   The area under the curve from one x to another (negative where the
+    //   curve is below 0, and when `from` is after `to`). Outside the points
+    //   it follows the curve's `outside`; with `.nan`, any part outside
+    //   makes it NaN.
+    fn integral(from: Float, to: Float) -> Float {
+        if from.isNaN || to.isNaN {
+            return 0.0 / 0.0
+        }
+        if from > to {
+            return -integral(from: to, to: from)
+        }
+        let n = xs.count
+        let first = xs[0]
+        let last = xs[n - 1]
+        if outside == .nan && (from < first || to > last) {
+            return 0.0 / 0.0
+        }
+        var total = 0.0
+        // Before the first point.
+        if from < first {
+            let stop = min(to, first)
+            if outside == .hold || isSteps {
+                total += ys[0] * (stop - from)
+            } else {
+                total += pieceArea(0, stop - first) - pieceArea(0, from - first)
+            }
+        }
+        // After the last point.
+        if to > last {
+            let start = max(from, last)
+            if outside == .hold || isSteps {
+                total += ys[n - 1] * (to - start)
+            } else {
+                let k = n - 2
+                total += pieceArea(k, to - xs[k]) - pieceArea(k, start - xs[k])
+            }
+        }
+        // Between the points.
+        let lo = max(from, first)
+        let hi = min(to, last)
+        if lo < hi {
+            let k0 = piece(lo)
+            let k1 = piece(hi)
+            for k in k0..(k1 + 1) {
+                let a = max(lo, xs[k])
+                let z = min(hi, xs[k + 1])
+                if z > a {
+                    total += if isSteps { stepArea(k, a, z) } else { pieceArea(k, z - xs[k]) - pieceArea(k, a - xs[k]) }
+                }
+            }
+        }
+        total
+    }
+
+    // The area under a step curve over [a, z], within piece k.
+    fn stepArea(_ k: Int, _ a: Float, _ z: Float) -> Float {
+        if step == .previous {
+            return ys[k] * (z - a)
+        }
+        if step == .next {
+            return ys[k + 1] * (z - a)
+        }
+        let mid = (xs[k] + xs[k + 1]) / 2.0
+        let left = max(0.0, min(z, mid) - a)
+        let right = max(0.0, z - max(a, mid))
+        ys[k] * left + ys[k + 1] * right
+    }
+
+    // xsFor(y)
+    //   Every x between the first and last point where the curve has the
+    //   value y, smallest first. Where the curve is level at y, the start of
+    //   that stretch.
+    fn xsFor(_ y: Float) -> [Float] {
+        var found: [Float] = []
+        if y.isNaN {
+            return found
+        }
+        let n = xs.count
+        if isSteps {
+            // Where each stretch at the value y begins.
+            for k in 0..n {
+                if ys[k] == y && (k == 0 || ys[k - 1] != y) {
+                    if k == 0 || step == .previous {
+                        found.append(xs[k])
+                    } else if step == .next {
+                        found.append(xs[k - 1])
+                    } else {
+                        found.append((xs[k - 1] + xs[k]) / 2.0)
+                    }
+                }
+            }
+            return found
+        }
+        for k in 0..(n - 1) {
+            let h = xs[k + 1] - xs[k]
+            for t in pieceRoots(ys[k] - y, b[k], c[k], d[k], h, false) {
+                found.append(xs[k] + t)
+            }
+        }
+        // The last point itself, from its own y (the last piece's value
+        // there can be off by a rounding).
+        if ys[n - 1] == y {
+            found.append(xs[n - 1])
+        }
+        // Roots found at a point by both pieces beside it count once.
+        var out: [Float] = []
+        for x in found {
+            if out.isEmpty || abs(x - out[out.count - 1]) > 1e-12 * max(1.0, abs(x)) {
+                out.append(x)
+            }
+        }
+        out
+    }
+
+    // xFor(y)
+    //   The first x (smallest) between the first and last point where the
+    //   curve has the value y, or nil if it never does there: reading a
+    //   table backwards, like the depth for a discharge.
+    fn xFor(_ y: Float) -> Float? {
+        let all = xsFor(y)
+        if all.isEmpty {
+            return nil
+        }
+        all[0]
+    }
+}
+
+// The t in [0, h] where a + b·t + c·t² + d·t³ = 0 (h itself only when
+// `withEnd`), smallest first.
+fn pieceRoots(_ a: Float, _ b: Float, _ c: Float, _ d: Float, _ h: Float, _ withEnd: Bool) -> [Float] {
+    // Split [0, h] where the cubic turns, so each part rises or falls.
+    var cuts: [Float] = [0.0]
+    // The turns are where the slope b + 2c·t + 3d·t² is 0. The quadratic
+    // formula is written the stable way (q, then q/A and C/q), as d can be
+    // tiny next to c (a piece that is nearly a parabola), where the usual
+    // form loses all its digits.
+    var turns: [Float] = []
+    let qa = 3.0 * d
+    let qb = 2.0 * c
+    let qc = b
+    let disc = qb * qb - 4.0 * qa * qc
+    if qa == 0.0 {
+        if qb != 0.0 {
+            turns.append(-qc / qb)
+        }
+    } else if disc >= 0.0 {
+        let q = -0.5 * (qb + (if qb >= 0.0 { sqrt(disc) } else { -sqrt(disc) }))
+        if q != 0.0 {
+            turns.append(q / qa)
+            turns.append(qc / q)
+        } else {
+            turns.append(0.0)
+        }
+    }
+    for t in turns.sorted() {
+        if t > 0.0 && t < h {
+            cuts.append(t)
+        }
+    }
+    cuts.append(h)
+    var roots: [Float] = []
+    for i in 0..(cuts.count - 1) {
+        var lo = cuts[i]
+        var hi = cuts[i + 1]
+        var flo = a + lo * (b + lo * (c + lo * d))
+        let fhi = a + hi * (b + hi * (c + hi * d))
+        if flo == 0.0 {
+            roots.append(lo)
+            continue
+        }
+        if (flo < 0.0) == (fhi < 0.0) || fhi == 0.0 {
+            continue
+        }
+        // Bisection: the part is monotone, so there's exactly one root.
+        for _ in 0..200 {
+            let mid = (lo + hi) / 2.0
+            if mid <= lo || mid >= hi {
+                break
+            }
+            let fm = a + mid * (b + mid * (c + mid * d))
+            if fm == 0.0 {
+                lo = mid
+                hi = mid
+                break
+            }
+            if (fm < 0.0) == (flo < 0.0) {
+                lo = mid
+                flo = fm
+            } else {
+                hi = mid
+            }
+        }
+        roots.append((lo + hi) / 2.0)
+    }
+    if withEnd {
+        let fh = a + h * (b + h * (c + h * d))
+        if fh == 0.0 {
+            roots.append(h)
+        }
+    }
+    roots
+}

@@ -1,0 +1,451 @@
+// interpolate: making an Interpolant through points. Each way works out a slope
+// at every point and joins the points with cubic pieces that have those
+// slopes (straight lines and steps aside), following SciPy's CubicSpline,
+// PchipInterpolator and Akima1DInterpolator, so the curves are the same.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// How a spline ends at its first or last point.
+public enum End {
+    // The last three points' pieces are one cubic (SciPy's and MATLAB's
+    // default).
+    notAKnot
+    // No bending at the end: the second derivative is 0.
+    natural
+    // The curve's slope there.
+    slope(value: Float)
+    // The curve's second derivative there.
+    bending(value: Float)
+}
+
+fn isNotAKnot(_ e: End) -> Bool {
+    match e {
+        .notAKnot -> true
+        _ -> false
+    }
+}
+
+// problem(xs, ys)
+//   What's wrong with points for a curve, or nil when nothing is: xs and
+//   ys of different lengths, fewer than 2 points, a NaN or infinite value,
+//   or two points with the same x. The ways to make a curve stop the
+//   program on these; check data read from a file with this first.
+//
+//   print(interpolate.problem([1, 2, 2], [5, 6, 7]) ?? "fine")   // two points have x = 2
+public fn problem(_ xs: [Float], _ ys: [Float]) -> String? {
+    if xs.count != ys.count {
+        return "there are {xs.count} x values but {ys.count} y values"
+    }
+    if xs.count < 2 {
+        return "a curve needs at least 2 points, not {xs.count}"
+    }
+    for (k, x) in xs.enumerated() {
+        if !x.isFinite {
+            return "x number {k + 1} is {x}"
+        }
+        if !ys[k].isFinite {
+            return "y number {k + 1} is {ys[k]}"
+        }
+    }
+    let sorted = xs.sorted()
+    for k in 1..sorted.count {
+        if sorted[k] == sorted[k - 1] {
+            return "two points have x = {sorted[k]}"
+        }
+    }
+    nil
+}
+
+fn fail(_ message: String) {
+    print("interpolate: {message}")
+    exit(1)
+}
+
+// The points in order of x (they may come in any order).
+fn ordered(_ xs: [Float], _ ys: [Float], _ what: String) -> ([Float], [Float]) {
+    if let p = problem(xs, ys) {
+        fail("{what}: {p}")
+    }
+    var ascending = true
+    for k in 1..xs.count {
+        if xs[k] <= xs[k - 1] {
+            ascending = false
+        }
+    }
+    if ascending {
+        return (xs, ys)
+    }
+    var order: [Int] = []
+    for k in 0..xs.count {
+        order.append(k)
+    }
+    order = order.sorted(by: { i, j in xs[i] < xs[j] })
+    var sx: [Float] = []
+    var sy: [Float] = []
+    for k in order {
+        sx.append(xs[k])
+        sy.append(ys[k])
+    }
+    (sx, sy)
+}
+
+// The curve through the points with these slopes at them.
+fn hermite(_ xs: [Float], _ ys: [Float], _ slopes: [Float], _ kind: String, _ outside: Outside) -> Interpolant {
+    var b: [Float] = []
+    var c: [Float] = []
+    var d: [Float] = []
+    for k in 0..(xs.count - 1) {
+        let h = xs[k + 1] - xs[k]
+        let m = (ys[k + 1] - ys[k]) / h
+        b.append(slopes[k])
+        c.append((3.0 * m - 2.0 * slopes[k] - slopes[k + 1]) / h)
+        d.append((slopes[k] + slopes[k + 1] - 2.0 * m) / (h * h))
+    }
+    Interpolant(xs: xs, ys: ys, b: b, c: c, d: d, outside: outside, kind: kind)
+}
+
+// linear(xs, ys, outside:)
+//   Straight lines from point to point, as when reading a table by hand.
+//
+//   let rating = interpolate.linear([0.5, 1.0, 1.5], [8.2, 23.0, 42.5])
+//   print(rating.at(1.25))            // 32.75
+public fn linear(_ xs: [Float], _ ys: [Float], outside: Outside = .extend) -> Interpolant {
+    let p = ordered(xs, ys, "linear")
+    let px = p.0
+    let py = p.1
+    var b: [Float] = []
+    var zeros: [Float] = []
+    for k in 0..(px.count - 1) {
+        b.append((py[k + 1] - py[k]) / (px[k + 1] - px[k]))
+        zeros.append(0.0)
+    }
+    Interpolant(xs: px, ys: py, b: b, c: zeros, d: zeros, outside: outside, kind: "linear")
+}
+
+// spline(xs, ys, start:, end:, outside:)
+//   The smooth cubic spline through the points: its slope and bending
+//   change without jumps. `start` and `end` say how it ends; both are
+//   `.notAKnot` unless you say.
+//
+//   let s = interpolate.spline([0, 1, 2, 3], [0, 1, 8, 27])
+//   print(s.at(1.5))                  // 3.375
+public fn spline(_ xs: [Float], _ ys: [Float], start: End = .notAKnot, end: End = .notAKnot,
+                 outside: Outside = .extend) -> Interpolant {
+    let p = ordered(xs, ys, "spline")
+    let x = p.0
+    let y = p.1
+    let n = x.count
+    var dx: [Float] = []
+    var m: [Float] = []
+    for k in 0..(n - 1) {
+        dx.append(x[k + 1] - x[k])
+        m.append((y[k + 1] - y[k]) / dx[k])
+    }
+    var first = start
+    var last = end
+    // With two points, a not-a-knot end is a straight line's slope.
+    if n == 2 {
+        if isNotAKnot(first) {
+            first = .slope(value: m[0])
+        }
+        if isNotAKnot(last) {
+            last = .slope(value: m[0])
+        }
+    }
+    var s: [Float] = []
+    if n == 3 && isNotAKnot(first) && isNotAKnot(last) {
+        // Both ends not-a-knot with three points: the parabola through them.
+        s = solve3([[1.0, 1.0, 0.0], [dx[1], 2.0 * (dx[0] + dx[1]), dx[0]], [0.0, 1.0, 1.0]],
+                   [2.0 * m[0], 3.0 * (dx[0] * m[1] + dx[1] * m[0]), 2.0 * m[1]])
+    } else {
+        // The slopes from a tridiagonal system: lower[k]·s[k-1] +
+        // diag[k]·s[k] + upper[k]·s[k+1] = rhs[k].
+        var lower: [Float] = []
+        var diag: [Float] = []
+        var upper: [Float] = []
+        var rhs: [Float] = []
+        for _ in 0..n {
+            lower.append(0.0)
+            diag.append(0.0)
+            upper.append(0.0)
+            rhs.append(0.0)
+        }
+        for k in 1..(n - 1) {
+            lower[k] = dx[k]
+            diag[k] = 2.0 * (dx[k - 1] + dx[k])
+            upper[k] = dx[k - 1]
+            rhs[k] = 3.0 * (dx[k] * m[k - 1] + dx[k - 1] * m[k])
+        }
+        match first {
+            .notAKnot -> {
+                let w = x[2] - x[0]
+                diag[0] = dx[1]
+                upper[0] = w
+                rhs[0] = ((dx[0] + 2.0 * w) * dx[1] * m[0] + dx[0] * dx[0] * m[1]) / w
+            }
+            .natural -> {
+                diag[0] = 2.0 * dx[0]
+                upper[0] = dx[0]
+                rhs[0] = 3.0 * (y[1] - y[0])
+            }
+            .slope(v) -> {
+                diag[0] = 1.0
+                upper[0] = 0.0
+                rhs[0] = v
+            }
+            .bending(v) -> {
+                diag[0] = 2.0 * dx[0]
+                upper[0] = dx[0]
+                rhs[0] = -0.5 * v * dx[0] * dx[0] + 3.0 * (y[1] - y[0])
+            }
+        }
+        match last {
+            .notAKnot -> {
+                let w = x[n - 1] - x[n - 3]
+                diag[n - 1] = dx[n - 3]
+                lower[n - 1] = w
+                rhs[n - 1] = (dx[n - 2] * dx[n - 2] * m[n - 3] + (2.0 * w + dx[n - 2]) * dx[n - 3] * m[n - 2]) / w
+            }
+            .natural -> {
+                diag[n - 1] = 2.0 * dx[n - 2]
+                lower[n - 1] = dx[n - 2]
+                rhs[n - 1] = 3.0 * (y[n - 1] - y[n - 2])
+            }
+            .slope(v) -> {
+                diag[n - 1] = 1.0
+                lower[n - 1] = 0.0
+                rhs[n - 1] = v
+            }
+            .bending(v) -> {
+                diag[n - 1] = 2.0 * dx[n - 2]
+                lower[n - 1] = dx[n - 2]
+                rhs[n - 1] = 0.5 * v * dx[n - 2] * dx[n - 2] + 3.0 * (y[n - 1] - y[n - 2])
+            }
+        }
+        s = solveTridiagonal(lower, diag, upper, rhs)
+    }
+    hermite(x, y, s, "spline", outside)
+}
+
+// A tridiagonal system, by elimination with row swaps (as LAPACK's gtsv),
+// which a not-a-knot end needs: its rows don't have the largest number on
+// the diagonal.
+fn solveTridiagonal(_ lower0: [Float], _ diag0: [Float], _ upper0: [Float], _ rhs0: [Float]) -> [Float] {
+    let n = diag0.count
+    // Row k holds dl (left of the diagonal), d, du, du2 (two right).
+    var dl = lower0
+    var d = diag0
+    var du = upper0
+    var du2: [Float] = []
+    var r = rhs0
+    for _ in 0..n {
+        du2.append(0.0)
+    }
+    for k in 0..(n - 1) {
+        // The row below has its number under the diagonal at dl[k + 1].
+        let below = dl[k + 1]
+        if abs(d[k]) >= abs(below) {
+            if d[k] != 0.0 {
+                let f = below / d[k]
+                d[k + 1] -= f * du[k]
+                r[k + 1] -= f * r[k]
+            }
+            dl[k + 1] = 0.0
+        } else {
+            // Swap rows k and k + 1.
+            let f = d[k] / below
+            d[k] = below
+            let t = d[k + 1]
+            d[k + 1] = du[k] - f * t
+            du[k] = t
+            if k + 1 < n - 1 {
+                du2[k] = du[k + 1]
+                du[k + 1] = -f * du2[k]
+            }
+            let rt = r[k]
+            r[k] = r[k + 1]
+            r[k + 1] = rt - f * r[k + 1]
+            dl[k + 1] = 0.0
+        }
+    }
+    var x: [Float] = []
+    for _ in 0..n {
+        x.append(0.0)
+    }
+    x[n - 1] = r[n - 1] / d[n - 1]
+    if n >= 2 {
+        x[n - 2] = (r[n - 2] - du[n - 2] * x[n - 1]) / d[n - 2]
+    }
+    var k = n - 3
+    while k >= 0 {
+        x[k] = (r[k] - du[k] * x[k + 1] - du2[k] * x[k + 2]) / d[k]
+        k -= 1
+    }
+    x
+}
+
+// A 3 × 3 system, by Gaussian elimination with row swaps.
+fn solve3(_ a0: [[Float]], _ b0: [Float]) -> [Float] {
+    var a = a0
+    var b = b0
+    for col in 0..3 {
+        var best = col
+        for row in (col + 1)..3 {
+            if abs(a[row][col]) > abs(a[best][col]) {
+                best = row
+            }
+        }
+        if best != col {
+            let tr = a[col]
+            a[col] = a[best]
+            a[best] = tr
+            let tb = b[col]
+            b[col] = b[best]
+            b[best] = tb
+        }
+        for row in (col + 1)..3 {
+            let f = a[row][col] / a[col][col]
+            for k in col..3 {
+                a[row][k] -= f * a[col][k]
+            }
+            b[row] -= f * b[col]
+        }
+    }
+    var x = [0.0, 0.0, 0.0]
+    var i = 2
+    while i >= 0 {
+        var sum = b[i]
+        for k in (i + 1)..3 {
+            sum -= a[i][k] * x[k]
+        }
+        x[i] = sum / a[i][i]
+        i -= 1
+    }
+    x
+}
+
+// -1, 0 or 1.
+fn sign(_ v: Float) -> Float {
+    if v > 0.0 { 1.0 } else if v < 0.0 { -1.0 } else { 0.0 }
+}
+
+// monotone(xs, ys, outside:)
+//   A smooth curve that keeps the data's shape: it rises where the points
+//   rise, falls where they fall, and never overshoots a point (SciPy's
+//   PchipInterpolator, MATLAB's pchip). The safe choice for tables like a
+//   rating curve, where a spline's wiggles would be wrong.
+public fn monotone(_ xs: [Float], _ ys: [Float], outside: Outside = .extend) -> Interpolant {
+    let p = ordered(xs, ys, "monotone")
+    let x = p.0
+    let y = p.1
+    let n = x.count
+    var h: [Float] = []
+    var m: [Float] = []
+    for k in 0..(n - 1) {
+        h.append(x[k + 1] - x[k])
+        m.append((y[k + 1] - y[k]) / h[k])
+    }
+    var s: [Float] = []
+    for _ in 0..n {
+        s.append(0.0)
+    }
+    if n == 2 {
+        s[0] = m[0]
+        s[1] = m[0]
+        return hermite(x, y, s, "monotone", outside)
+    }
+    for k in 1..(n - 1) {
+        if sign(m[k - 1]) != sign(m[k]) || m[k - 1] == 0.0 || m[k] == 0.0 {
+            s[k] = 0.0
+        } else {
+            // A weighted harmonic mean of the slopes beside it.
+            let w1 = 2.0 * h[k] + h[k - 1]
+            let w2 = h[k] + 2.0 * h[k - 1]
+            s[k] = (w1 + w2) / (w1 / m[k - 1] + w2 / m[k])
+        }
+    }
+    s[0] = edgeSlope(h[0], h[1], m[0], m[1])
+    s[n - 1] = edgeSlope(h[n - 2], h[n - 3], m[n - 2], m[n - 3])
+    hermite(x, y, s, "monotone", outside)
+}
+
+// The slope at an end point that keeps the shape (Moler's pchiptx).
+fn edgeSlope(_ h0: Float, _ h1: Float, _ m0: Float, _ m1: Float) -> Float {
+    let d = ((2.0 * h0 + h1) * m0 - h0 * m1) / (h0 + h1)
+    if sign(d) != sign(m0) {
+        return 0.0
+    }
+    if sign(m0) != sign(m1) && abs(d) > 3.0 * abs(m0) {
+        return 3.0 * m0
+    }
+    d
+}
+
+// akima(xs, ys, modified:, outside:)
+//   Akima's curve: each point's slope is weighted towards the side where
+//   the data is steadier, so one odd point doesn't make waves along the
+//   whole curve, as it can in a spline. `modified: true` is the modified
+//   Akima curve (MATLAB's makima), which also keeps flat stretches flat.
+//   With 2 points it's a straight line.
+public fn akima(_ xs: [Float], _ ys: [Float], modified: Bool = false, outside: Outside = .extend) -> Interpolant {
+    let p = ordered(xs, ys, "akima")
+    let x = p.0
+    let y = p.1
+    let n = x.count
+    let kind = if modified { "makima" } else { "akima" }
+    if n == 2 {
+        let slope = (y[1] - y[0]) / (x[1] - x[0])
+        return hermite(x, y, [slope, slope], kind, outside)
+    }
+    // The pieces' slopes, with two made up at each end: m[k + 2] is piece k's.
+    var m: [Float] = []
+    for _ in 0..(n + 3) {
+        m.append(0.0)
+    }
+    for k in 0..(n - 1) {
+        m[k + 2] = (y[k + 1] - y[k]) / (x[k + 1] - x[k])
+    }
+    m[1] = 2.0 * m[2] - m[3]
+    m[0] = 2.0 * m[1] - m[2]
+    m[n + 1] = 2.0 * m[n] - m[n - 1]
+    m[n + 2] = 2.0 * m[n + 1] - m[n]
+    var f1: [Float] = []
+    var f2: [Float] = []
+    var biggest = -1.0 / 0.0
+    for k in 0..n {
+        var a = abs(m[k + 3] - m[k + 2])
+        var z = abs(m[k + 1] - m[k])
+        if modified {
+            a += 0.5 * abs(m[k + 3] + m[k + 2])
+            z += 0.5 * abs(m[k + 1] + m[k])
+        }
+        f1.append(a)
+        f2.append(z)
+        biggest = max(biggest, a + z)
+    }
+    var s: [Float] = []
+    for k in 0..n {
+        let f12 = f1[k] + f2[k]
+        if f12 > 1e-9 * biggest {
+            s.append((f1[k] * m[k + 1] + f2[k] * m[k + 2]) / f12)
+        } else {
+            // The slope isn't set by the weights: the average of the two beside.
+            s.append(0.5 * (m[k + 3] + m[k]))
+        }
+    }
+    hermite(x, y, s, kind, outside)
+}
+
+// steps(xs, ys, step:, outside:)
+//   A value that stays flat between points: the point before's (the
+//   default), the point after's, or the nearer one's. Outside the points it
+//   holds the end values unless `outside` is `.nan`.
+public fn steps(_ xs: [Float], _ ys: [Float], step: Step = .previous, outside: Outside = .hold) -> Interpolant {
+    let p = ordered(xs, ys, "steps")
+    var zeros: [Float] = []
+    for _ in 0..(p.0.count - 1) {
+        zeros.append(0.0)
+    }
+    Interpolant(xs: p.0, ys: p.1, b: zeros, c: zeros, d: zeros, outside: outside, isSteps: true, step: step, kind: "steps")
+}

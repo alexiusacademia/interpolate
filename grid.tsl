@@ -1,0 +1,121 @@
+// interpolate: two-way tables. A Grid holds a value for each pair of an x
+// and a y, like a design chart read by two numbers, and gives the value at
+// any x and y in between by bilinear interpolation (SciPy's
+// RegularGridInterpolator, method "linear").
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+// A table of values: zs[i][j] is the value at xs[i] and ys[j].
+public struct Grid {
+    xs: [Float]
+    ys: [Float]
+    zs: [[Float]]
+    outside: Outside = .extend
+
+    // at(x, y)
+    //   The value at x and y: from the four table values around them, each
+    //   weighted by how near it is. Outside the table it extends the edge
+    //   cells' planes, holds the edge values, or gives NaN, as `outside`
+    //   says.
+    fn at(_ x: Float, _ y: Float) -> Float {
+        if x.isNaN || y.isNaN {
+            return 0.0 / 0.0
+        }
+        let nx = xs.count
+        let ny = ys.count
+        let out = x < xs[0] || x > xs[nx - 1] || y < ys[0] || y > ys[ny - 1]
+        var u = x
+        var v = y
+        if out {
+            if outside == .nan {
+                return 0.0 / 0.0
+            }
+            if outside == .hold {
+                u = min(max(x, xs[0]), xs[nx - 1])
+                v = min(max(y, ys[0]), ys[ny - 1])
+            }
+        }
+        let i = cell(xs, u)
+        let j = cell(ys, v)
+        let tx = (u - xs[i]) / (xs[i + 1] - xs[i])
+        let ty = (v - ys[j]) / (ys[j + 1] - ys[j])
+        let low = zs[i][j] + (zs[i + 1][j] - zs[i][j]) * tx
+        let high = zs[i][j + 1] + (zs[i + 1][j + 1] - zs[i][j + 1]) * tx
+        low + (high - low) * ty
+    }
+
+    // values(xs, ys)
+    //   The value at each pair (xs[k], ys[k]).
+    fn values(_ px: [Float], _ py: [Float]) -> [Float] {
+        if px.count != py.count {
+            fail("Grid.values: {px.count} x values but {py.count} y values")
+        }
+        var out: [Float] = []
+        for (k, x) in px.enumerated() {
+            out.append(at(x, py[k]))
+        }
+        out
+    }
+}
+
+// The cell of an axis that v falls in: the last k with axis[k] <= v, kept
+// between 0 and the last cell.
+fn cell(_ axis: [Float], _ v: Float) -> Int {
+    let n = axis.count
+    if v <= axis[0] {
+        return 0
+    }
+    if v >= axis[n - 2] {
+        return n - 2
+    }
+    var lo = 0
+    var hi = n - 2
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2
+        if axis[mid] <= v {
+            lo = mid
+        } else {
+            hi = mid
+        }
+    }
+    lo
+}
+
+// Whether an axis rises strictly and has only ordinary numbers.
+fn risingAxis(_ axis: [Float]) -> Bool {
+    for (k, v) in axis.enumerated() {
+        if !v.isFinite || (k > 0 && v <= axis[k - 1]) {
+            return false
+        }
+    }
+    true
+}
+
+// grid(xs, ys, zs, outside:)
+//   A two-way table: `zs` has a row for each x, and each row a value for
+//   each y. The xs and the ys must each rise, with at least 2 of each.
+//
+//   // Values for x = 0, 10 (rows) and y = 0, 1, 2 (columns).
+//   let g = interpolate.grid([0, 10], [0, 1, 2], [[1, 2, 3], [11, 12, 13]])
+//   print(g.at(5, 1.5))                // 7.5
+public fn grid(_ xs: [Float], _ ys: [Float], _ zs: [[Float]], outside: Outside = .extend) -> Grid {
+    if xs.count < 2 || ys.count < 2 {
+        fail("grid: it needs at least 2 xs and 2 ys, not {xs.count} and {ys.count}")
+    }
+    if !risingAxis(xs) {
+        fail("grid: the xs must be ordinary numbers that rise: {xs}")
+    }
+    if !risingAxis(ys) {
+        fail("grid: the ys must be ordinary numbers that rise: {ys}")
+    }
+    if zs.count != xs.count {
+        fail("grid: there are {xs.count} xs but {zs.count} rows of values: a row for each x")
+    }
+    for (i, row) in zs.enumerated() {
+        if row.count != ys.count {
+            fail("grid: row {i + 1} has {row.count} values but there are {ys.count} ys: a value for each y")
+        }
+    }
+    Grid(xs: xs, ys: ys, zs: zs, outside: outside)
+}

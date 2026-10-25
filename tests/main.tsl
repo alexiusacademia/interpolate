@@ -1,0 +1,344 @@
+// interpolate's tests. First, thousands of values checked against SciPy,
+// saved in cases.json by tools/oracle/oracle.py: curves of every kind
+// through random tables (values, slopes, second derivatives, areas, and
+// the xs for given ys, inside and outside the points), steps, and grids.
+// Then the API by hand, including 0.1's interpolate(p1:p3:y2:).
+// `tessel run tests` prints the failures and a count, and exits with 1 if
+// any check failed.
+//
+// Author: Alexius Academia
+// Date: 2026-10-25
+
+import ".."
+
+// A curve case from cases.json. NaN is written as 1e308.
+struct CurveCase {
+    kind: String
+    xs: [Float]
+    ys: [Float]
+    start: String
+    startValue: Float
+    end: String
+    endValue: Float
+    modified: Bool
+    outside: String
+    step: String
+    probes: [Float]
+    at: [Float]
+    slope: [Float]
+    second: [Float]
+    areas: [[Float]]
+    roots: [[Float]]
+}
+
+struct GridCase {
+    xs: [Float]
+    ys: [Float]
+    zs: [[Float]]
+    outside: String
+    points: [[Float]]
+}
+
+struct Cases {
+    curves: [CurveCase]
+    grids: [GridCase]
+}
+
+let nanCode = 1e308
+
+fn decoded(_ v: Float) -> Float {
+    if v == nanCode { 0.0 / 0.0 } else { v }
+}
+
+// Whether got is expected, to about 1e-8 of the size of what's involved.
+fn near(_ got: Float, _ expected0: Float, _ scale: Float) -> Bool {
+    let expected = decoded(expected0)
+    if expected.isNaN || got.isNaN {
+        return expected.isNaN && got.isNaN
+    }
+    abs(got - expected) <= 1e-8 * max(scale, max(abs(expected), 1.0))
+}
+
+// The xs with those closer than a millionth to the one before left out.
+fn merged(_ xs: [Float]) -> [Float] {
+    var out: [Float] = []
+    for x in xs {
+        if out.isEmpty || abs(x - out[out.count - 1]) > 1e-6 * max(1.0, abs(x)) {
+            out.append(x)
+        }
+    }
+    out
+}
+
+fn outsideOf(_ s: String) -> interpolate.Outside {
+    if s == "hold" { .hold } else if s == "nan" { .nan } else { .extend }
+}
+
+fn endOf(_ kind: String, _ v: Float) -> interpolate.End {
+    if kind == "natural" {
+        return .natural
+    }
+    if kind == "slope" {
+        return .slope(value: v)
+    }
+    if kind == "bending" {
+        return .bending(value: v)
+    }
+    interpolate.End.notAKnot
+}
+
+fn stepOf(_ s: String) -> interpolate.Step {
+    if s == "next" { .next } else if s == "nearest" { .nearest } else { .previous }
+}
+
+fn curveOf(_ c: CurveCase) -> interpolate.Interpolant {
+    let out = outsideOf(c.outside)
+    if c.kind == "linear" {
+        return interpolate.linear(c.xs, c.ys, outside: out)
+    }
+    if c.kind == "spline" {
+        return interpolate.spline(c.xs, c.ys, start: endOf(c.start, c.startValue), end: endOf(c.end, c.endValue), outside: out)
+    }
+    if c.kind == "monotone" {
+        return interpolate.monotone(c.xs, c.ys, outside: out)
+    }
+    if c.kind == "akima" {
+        return interpolate.akima(c.xs, c.ys, modified: c.modified, outside: out)
+    }
+    interpolate.steps(c.xs, c.ys, step: stepOf(c.step), outside: out)
+}
+
+// How big the numbers of a case are, for the tolerance: values far beyond
+// the points grow with the distance cubed.
+fn scaleOf(_ c: CurveCase) -> Float {
+    var big = 1.0
+    for y in c.ys {
+        big = max(big, abs(y))
+    }
+    let span = c.xs[c.xs.count - 1] - c.xs[0]
+    big * max(1.0, span * span * span)
+}
+
+fn oracle() -> Int {
+    var path = "tests/cases.json"
+    if !fileExists(path) {
+        path = "cases.json"
+    }
+    let text = readFile(path) ?? ""
+    let loaded: Cases? = fromJson(text)
+    if loaded == nil {
+        print("FAIL  can't read {path}")
+        return 1
+    }
+    let cases = loaded ?? Cases(curves: [], grids: [])
+    var checks = 0
+    var failed = 0
+    var shown = 0
+    for c in cases.curves {
+        let curve = curveOf(c)
+        let scale = scaleOf(c)
+        var problems: [String] = []
+        for (k, x) in c.probes.enumerated() {
+            checks += 1
+            if !near(curve.at(x), c.at[k], scale) {
+                problems.append("at({x}) = {curve.at(x)}, SciPy {decoded(c.at[k])}")
+            }
+            if k < c.slope.count {
+                checks += 2
+                if !near(curve.slope(x), c.slope[k], scale) {
+                    problems.append("slope({x}) = {curve.slope(x)}, SciPy {decoded(c.slope[k])}")
+                }
+                if !near(curve.secondDerivative(x), c.second[k], scale) {
+                    problems.append("secondDerivative({x}) = {curve.secondDerivative(x)}, SciPy {decoded(c.second[k])}")
+                }
+            }
+        }
+        for a in c.areas {
+            checks += 1
+            let got = curve.integral(from: a[0], to: a[1])
+            if !near(got, a[2], scale * max(1.0, abs(a[1] - a[0]))) {
+                problems.append("integral({a[0]}, {a[1]}) = {got}, SciPy {decoded(a[2])}")
+            }
+        }
+        for r in c.roots {
+            checks += 1
+            let y = r[0]
+            var want: [Float] = []
+            for (k, v) in r.enumerated() {
+                if k > 0 {
+                    want.append(v)
+                }
+            }
+            let got = curve.xsFor(y)
+            // SciPy lists a crossing at a point twice (once from each piece)
+            // and misses some exactly at the last point, so: every distinct
+            // crossing of SciPy's must be found, and every one found must be
+            // on the curve, at the value y, between the points.
+            var same = true
+            for x in merged(want) {
+                if !got.any(where: { g in abs(g - x) <= 1e-6 * max(1.0, abs(x)) }) {
+                    same = false
+                }
+            }
+            for x in got {
+                if x < c.xs[0] || x > c.xs[c.xs.count - 1] || abs(curve.at(x) - y) > 1e-8 * scale {
+                    same = false
+                }
+            }
+            if !same {
+                problems.append("xsFor({y}) = {got}, SciPy {want}")
+            }
+        }
+        if !problems.isEmpty {
+            failed += 1
+            if shown < 20 {
+                shown += 1
+                print("FAIL  {c.kind} {c.start}/{c.end} modified {c.modified} outside {c.outside} {c.step} through {c.xs.count} points: {problems[0]} ({problems.count} wrong)")
+            }
+        }
+    }
+    for g in cases.grids {
+        let grid = interpolate.grid(g.xs, g.ys, g.zs, outside: outsideOf(g.outside))
+        var bad = ""
+        for p in g.points {
+            checks += 1
+            let got = grid.at(p[0], p[1])
+            if !near(got, p[2], 1e4) && bad.isEmpty {
+                bad = "at({p[0]}, {p[1]}) = {got}, SciPy {decoded(p[2])}"
+            }
+        }
+        if !bad.isEmpty {
+            failed += 1
+            if shown < 20 {
+                shown += 1
+                print("FAIL  grid {g.xs.count}×{g.ys.count} outside {g.outside}: {bad}")
+            }
+        }
+    }
+    print("{cases.curves.count + cases.grids.count - failed} of {cases.curves.count + cases.grids.count} tables agree with SciPy ({checks} values)")
+    failed
+}
+
+// Checks that `got` is true: 1 if it isn't.
+fn holds(_ name: String, _ got: Bool) -> Int {
+    if got {
+        print("ok    {name}")
+        return 0
+    }
+    print("FAIL  {name}")
+    1
+}
+
+fn close(_ a: Float, _ b: Float) -> Bool {
+    abs(a - b) <= 1e-9 * max(1.0, abs(b))
+}
+
+fn byHand() -> Int {
+    var failed = 0
+    // 0.1's function is unchanged.
+    let a = interpolate.Point(x: 10.0, y: 100.0)
+    let b = interpolate.Point(x: 20.0, y: 200.0)
+    failed += holds("0.1: interpolate(p1:p3:y2:)", interpolate.interpolate(p1: a, p3: b, y2: 150.0) == 15.0)
+    failed += holds("0.1: beyond the points", interpolate.interpolate(p1: a, p3: b, y2: 250.0) == 25.0)
+
+    let rating = interpolate.linear([0.5, 1.0, 1.5], [8.2, 23.0, 42.5])
+    failed += holds("linear at", close(rating.at(1.25), 32.75))
+    failed += holds("linear xFor: reading a table backwards", close(rating.xFor(32.75) ?? 0.0, 1.25))
+    failed += holds("xFor gives nil where it never gets", rating.xFor(100.0) == nil)
+    failed += holds("linear integral", close(rating.integral(from: 0.5, to: 1.0), 0.5 * (8.2 + 23.0) / 2.0))
+    failed += holds("integral backwards is negative", close(rating.integral(from: 1.0, to: 0.5), -rating.integral(from: 0.5, to: 1.0)))
+    failed += holds("values", rating.values([0.5, 1.5]) == [8.2, 42.5])
+    failed += holds("kind", rating.kind == "linear")
+
+    let shuffled = interpolate.linear([3, 1, 2], [30, 10, 20])
+    failed += holds("points in any order", shuffled.xs == [1, 2, 3] && close(shuffled.at(2.5), 25.0))
+
+    let cube = interpolate.spline([0, 1, 2, 3], [0, 1, 8, 27])
+    failed += holds("a not-a-knot spline is exact for a cubic", close(cube.at(1.5), 3.375) && close(cube.slope(2.0), 12.0))
+    let natural = interpolate.spline([0, 1, 2], [0, 1, 0], start: .natural, end: .natural)
+    failed += holds("natural ends don't bend", close(natural.secondDerivative(0.0), 0.0) && close(natural.secondDerivative(2.0), 0.0))
+    let clamped = interpolate.spline([0, 1, 2], [0, 1, 0], start: .slope(value: 2.0), end: .slope(value: -2.0))
+    failed += holds("clamped ends have their slopes", close(clamped.slope(0.0), 2.0) && close(clamped.slope(2.0), -2.0))
+
+    let wavy = [0.0, 0.0, 0.0, 10.0, 10.0, 10.0]
+    let xs = [0.0, 1, 2, 3, 4, 5]
+    let shape = interpolate.monotone(xs, wavy)
+    var keeps = true
+    var overshoots = false
+    var t = 0.0
+    while t <= 5.0 {
+        let v = shape.at(t)
+        if v < -1e-12 || v > 10.0 + 1e-12 {
+            keeps = false
+        }
+        if interpolate.spline(xs, wavy).at(t) < -0.01 {
+            overshoots = true
+        }
+        t += 0.01
+    }
+    failed += holds("monotone never overshoots (a spline does)", keeps && overshoots)
+
+    let outlier = interpolate.akima([0, 1, 2, 3, 4, 5, 6], [0, 0, 0, 5, 0, 0, 0])
+    failed += holds("akima stays flat away from an odd point", close(outlier.at(0.5), 0.0) && close(outlier.at(5.5), 0.0))
+
+    let held = interpolate.linear([0, 1], [5, 7], outside: .hold)
+    failed += holds("hold", held.at(-3.0) == 5.0 && held.at(9.0) == 7.0 && held.slope(9.0) == 0.0)
+    failed += holds("hold integral", close(held.integral(from: -1.0, to: 2.0), 5.0 + 6.0 + 7.0))
+    let none = interpolate.linear([0, 1], [5, 7], outside: .nan)
+    failed += holds("nan outside", none.at(-0.1).isNaN && none.at(0.5) == 6.0 && none.integral(from: -1.0, to: 1.0).isNaN)
+    let extended = interpolate.linear([0, 1], [5, 7])
+    failed += holds("extend", extended.at(2.0) == 9.0)
+
+    let stairs = interpolate.steps([0, 1, 2], [10, 20, 30])
+    failed += holds("steps: previous", stairs.at(0.5) == 10.0 && stairs.at(1.0) == 20.0 && stairs.at(5.0) == 30.0)
+    failed += holds("steps: next", interpolate.steps([0, 1, 2], [10, 20, 30], step: .next).at(0.5) == 20.0)
+    failed += holds("steps: nearest", interpolate.steps([0, 1, 2], [10, 20, 30], step: .nearest).at(0.5) == 10.0)
+    failed += holds("steps: area", close(stairs.integral(from: 0.0, to: 2.0), 30.0))
+    failed += holds("steps: xFor", stairs.xFor(20.0) == 1.0)
+
+    let wave = interpolate.spline([0, 1, 2, 3, 4], [0, 1, 0, -1, 0])
+    failed += holds("xsFor finds every crossing", wave.xsFor(0.0).count == 3)
+
+    failed += holds("problem: counts", interpolate.problem([1, 2], [1]) == "there are 2 x values but 1 y values")
+    failed += holds("problem: too few", interpolate.problem([1], [1]) == "a curve needs at least 2 points, not 1")
+    failed += holds("problem: repeated x", interpolate.problem([1, 2, 2], [5, 6, 7]) == "two points have x = 2.0")
+    failed += holds("problem: NaN", interpolate.problem([1, 0.0 / 0.0], [1, 2]) != nil)
+    failed += holds("problem: fine", interpolate.problem([1, 2], [3, 4]) == nil)
+
+    let g = interpolate.grid([0, 10], [0, 1, 2], [[1, 2, 3], [11, 12, 13]])
+    failed += holds("grid", close(g.at(5.0, 1.5), 7.5))
+    failed += holds("grid corners", g.at(0.0, 0.0) == 1.0 && g.at(10.0, 2.0) == 13.0)
+    failed += holds("grid values", g.values([0.0, 10.0], [0.0, 2.0]) == [1.0, 13.0])
+    failed
+}
+
+// Speed: a 10 000-point spline, and a million lookups.
+fn speed() -> Int {
+    var xs: [Float] = []
+    var ys: [Float] = []
+    for k in 0..10000 {
+        xs.append(Float(k) * 0.1)
+        ys.append(sin(Float(k) * 0.1))
+    }
+    let t0 = now()
+    let s = interpolate.spline(xs, ys)
+    let built = now() - t0
+    let t1 = now()
+    var sum = 0.0
+    for k in 0..1000000 {
+        sum += s.at(Float(k) * 0.000999)
+    }
+    let looked = now() - t1
+    holds("10 000-point spline in {(built * 1000.0).formatted(decimals: 2)} ms; a million values in {looked.formatted(decimals: 2)} s", sum.isFinite && looked < 30.0)
+}
+
+fn main() {
+    var failed = oracle()
+    failed += byHand()
+    failed += speed()
+    if failed > 0 {
+        print("\n{failed} failed")
+        exit(1)
+    }
+    print("\nall passed")
+}
