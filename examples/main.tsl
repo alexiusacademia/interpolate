@@ -1,0 +1,234 @@
+// interpolate's examples: the README's pictures, drawn with the chart
+// library. `tessel run examples` from the library's folder saves them in
+// docs/:
+//   curves.png     one table through linear, spline, monotone and akima
+//   rating.png     a rating curve read both ways, and the area under it
+//   scattered.png  survey points: the TIN's triangles and contours, and
+//                  the thin-plate spline's contours
+//   methods.png    the same points by tin, nearest, idw and rbf
+//   section.png    a cross-section through the four surfaces
+//
+// Author: Alexius Academia
+// Date: 2026-10-30
+
+import ".."
+import chart
+
+let nan = 0.0 / 0.0
+
+// The ground the survey points are taken from: two hills on a slope.
+fn ground(_ x: Float, _ y: Float) -> Float {
+    100.0 + 6.0 * exp(-((x - 30.0) * (x - 30.0) + (y - 60.0) * (y - 60.0)) / 500.0) +
+        4.0 * exp(-((x - 75.0) * (x - 75.0) + (y - 30.0) * (y - 30.0)) / 300.0) + 0.03 * x
+}
+
+// Seventy survey points, the same every run.
+fn survey() -> ([Float], [Float], [Float]) {
+    var xs: [Float] = []
+    var ys: [Float] = []
+    var zs: [Float] = []
+    var seed = 7
+    for _ in 0..70 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let x = Float(seed % 10000) / 100.0
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let y = Float(seed % 10000) / 100.0
+        xs.append(x)
+        ys.append(y)
+        zs.append(round(ground(x, y) * 100.0) / 100.0)
+    }
+    (xs, ys, zs)
+}
+
+// A color for a level, from blue (low) to brown (high).
+fn levelColor(_ level: Float) -> Color {
+    let f = ((level - 100.0) / 9.0).clamped(min: 0.0, max: 1.0)
+    Color.rgba(Int(30.0 + 170.0 * f), Int(110.0 + 10.0 * (1.0 - f)), Int(210.0 - 160.0 * f), 1.0)
+}
+
+// Contour lines on a chart: one line series for each level, with the
+// lines of that level joined by NaN breaks. Whole metres are thicker.
+fn addContours(_ c: chart.Chart, _ lines: [interpolate.Contour]) -> chart.Chart {
+    var out = c
+    var levels: [Float] = []
+    for l in lines {
+        if !levels.contains(l.level) {
+            levels.append(l.level)
+        }
+    }
+    for level in levels {
+        var xs: [Float] = []
+        var ys: [Float] = []
+        for l in lines {
+            if l.level != level {
+                continue
+            }
+            var k = 0
+            while k < l.points.count {
+                xs.append(l.points[k])
+                ys.append(l.points[k + 1])
+                k += 2
+            }
+            if l.closed {
+                xs.append(l.points[0])
+                ys.append(l.points[1])
+            }
+            xs.append(nan)
+            ys.append(nan)
+        }
+        let whole = level == round(level)
+        out.line(xs, ys, color: levelColor(level), width: if whole { 1.8 } else { 0.9 })
+    }
+    out
+}
+
+// The edges of a triangulation, as one line series with breaks.
+fn addTriangles(_ c: chart.Chart, _ t: interpolate.Triangulation) -> chart.Chart {
+    var out = c
+    let e = t.edges()
+    var xs: [Float] = []
+    var ys: [Float] = []
+    var k = 0
+    while k < e.count {
+        xs.append(t.xs[e[k]])
+        ys.append(t.ys[e[k]])
+        xs.append(t.xs[e[k + 1]])
+        ys.append(t.ys[e[k + 1]])
+        xs.append(nan)
+        ys.append(nan)
+        k += 2
+    }
+    out.line(xs, ys, color: .rgba(142, 142, 147, 0.5), width: 0.7)
+    out
+}
+
+// The contour lines of any surface: a TIN of its values on a fine grid.
+fn surfaceContours(_ s: interpolate.Surface, _ levels: [Float]) -> [interpolate.Contour] {
+    var axis: [Float] = []
+    var v = 0.0
+    while v <= 100.0 {
+        axis.append(v)
+        v += 1.0
+    }
+    let g = s.onGrid(xs: axis, ys: axis)
+    var fx: [Float] = []
+    var fy: [Float] = []
+    var fz: [Float] = []
+    for i in 0..axis.count {
+        for j in 0..axis.count {
+            if g.zs[i][j].isFinite {
+                fx.append(axis[i])
+                fy.append(axis[j])
+                fz.append(g.zs[i][j])
+            }
+        }
+    }
+    interpolate.tin(fx, fy, fz).contours(levels)
+}
+
+fn plan(_ title: String) -> chart.Chart {
+    chart.Chart(title: title, xLabel: "East (m)", yLabel: "North (m)", xMin: 0, xMax: 100, yMin: 0, yMax: 100,
+                equalAspect: true, grid: false, legend: .hidden)
+}
+
+fn curves() {
+    let xs: [Float] = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    let ys: [Float] = [0, 0.2, 0.1, 0.3, 4, 4.2, 4.1, 4.3, 4.2]
+    var c = chart.Chart(title: "One table, four curves", xLabel: "x", yLabel: "y", legend: .topLeading)
+    let kinds: [(String, interpolate.Interpolant)] = [("linear", interpolate.linear(xs, ys)),
+        ("spline", interpolate.spline(xs, ys)), ("monotone", interpolate.monotone(xs, ys)),
+        ("akima", interpolate.akima(xs, ys))]
+    for (name, curve) in kinds {
+        c.function(from: 0, to: 8, steps: 400, name: name) { x in curve.at(x) }
+    }
+    c.scatter(xs, ys, name: "points", color: .black, size: 4.5)
+    print(c.savePNG("docs/curves.png", width: 680, height: 400))
+}
+
+fn rating() {
+    // Discharge (m³/s) for water depths (m).
+    let depth: [Float] = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+    let flow: [Float] = [8.2, 23.0, 42.5, 66.0, 93.1, 124.0]
+    let r = interpolate.monotone(depth, flow)
+    let d50 = r.xFor(50.0) ?? 0.0
+    var c = chart.Chart(title: "A rating curve read both ways", xLabel: "Depth (m)", yLabel: "Discharge (m³/s)",
+                        yMin: 0, legend: .topLeading)
+    c.function(from: 0.5, to: 3.0, steps: 200, name: "monotone(depth, flow)") { x in r.at(x) }
+    c.scatter(depth, flow, name: "gauged", color: .black, size: 4.5)
+    c.point(x: 1.2, y: r.at(1.2), label: "at(1.2) = {r.at(1.2).formatted(decimals: 1)} m³/s")
+    c.point(x: d50, y: 50.0, label: "xFor(50) = {d50.formatted(decimals: 3)} m")
+    c.horizontalLine(50.0)
+    c.verticalLine(d50)
+    print(c.savePNG("docs/rating.png", width: 680, height: 400))
+}
+
+fn scattered() {
+    let (xs, ys, zs) = survey()
+    let levels = interpolate.levelsBetween(100.0, 110.0, step: 0.5)
+    let tin = interpolate.tin(xs, ys, zs)
+    var left = addTriangles(plan("tin: triangles and contours"), tin.triangulation)
+    left = addContours(left, tin.contours(levels))
+    left.scatter(xs, ys, color: .black, size: 3.0)
+    var right = addContours(plan("rbf: thin-plate spline"), surfaceContours(interpolate.rbf(xs, ys, zs), levels))
+    right.scatter(xs, ys, color: .black, size: 3.0)
+    let ok = renderImage(path: "docs/scattered.png", width: 760, height: 400, scale: 2) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .white)
+        let _a = left.draw(g, x: 0, y: 0, width: 380, height: 400)
+        let _b = right.draw(g, x: 380, y: 0, width: 380, height: 400)
+    }
+    print(ok)
+}
+
+fn methods() {
+    let (xs, ys, zs) = survey()
+    let levels = interpolate.levelsBetween(100.0, 110.0, step: 0.5)
+    let surfaces: [(String, interpolate.Surface)] = [("tin", interpolate.tin(xs, ys, zs)),
+        ("nearest", interpolate.nearest(xs, ys, zs)), ("idw (power 2)", interpolate.idw(xs, ys, zs)),
+        ("rbf (thin-plate)", interpolate.rbf(xs, ys, zs))]
+    var charts: [chart.Chart] = []
+    for (name, s) in surfaces {
+        let lines = if name == "tin" { s.contours(levels) } else { surfaceContours(s, levels) }
+        var c = addContours(plan(name), lines)
+        c.scatter(xs, ys, color: .black, size: 2.5)
+        charts.append(c)
+    }
+    let ok = renderImage(path: "docs/methods.png", width: 760, height: 760, scale: 2) { g in
+        g.fillRect(x: 0, y: 0, width: g.width, height: g.height, color: .white)
+        for (k, c) in charts.enumerated() {
+            let _f = c.draw(g, x: Float(k % 2) * 380.0, y: Float(k / 2) * 380.0, width: 380, height: 380)
+        }
+    }
+    print(ok)
+}
+
+fn section() {
+    let (xs, ys, zs) = survey()
+    let y = 45.0
+    var c = chart.Chart(title: "A section along y = 45 m", xLabel: "East (m)", yLabel: "Level (m)", legend: .bottomTrailing)
+    c.function(from: 0, to: 100, steps: 300, name: "the ground the points came from", color: .rgba(142, 142, 147, 1.0), dash: [5, 3]) { x in ground(x, y) }
+    let surfaces: [(String, interpolate.Surface)] = [("tin (NaN outside the outline)", interpolate.tin(xs, ys, zs)),
+        ("nearest", interpolate.nearest(xs, ys, zs)), ("idw", interpolate.idw(xs, ys, zs)),
+        ("rbf", interpolate.rbf(xs, ys, zs))]
+    for (name, s) in surfaces {
+        c.function(from: 0, to: 100, steps: 400, name: name) { x in s.at(x, y) }
+    }
+    // The survey points within 5 m of the section.
+    var px: [Float] = []
+    var pz: [Float] = []
+    for k in 0..xs.count {
+        if abs(ys[k] - y) <= 5.0 {
+            px.append(xs[k])
+            pz.append(zs[k])
+        }
+    }
+    c.scatter(px, pz, name: "points within 5 m", color: .black, size: 4.0)
+    print(c.savePNG("docs/section.png", width: 680, height: 400))
+}
+
+fn main() {
+    curves()
+    rating()
+    scattered()
+    methods()
+    section()
+}

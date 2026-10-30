@@ -1,0 +1,616 @@
+// interpolate: Delaunay triangulation of scattered points. The triangles
+// join the points so that no point lies inside any triangle's circumcircle,
+// which gives the fattest triangles possible: the triangulation behind TIN
+// ground models, SciPy's Delaunay and griddata "linear".
+//
+// It's built in two steps. A sweep adds the points in order of distance
+// from a first triangle, joining each to the edges of the hull it can see.
+// Then edges are flipped until every pair of triangles passes the circle
+// test (Lawson's flips).
+//
+// Author: Alexius Academia
+// Date: 2026-10-30
+
+// triangulation:
+//   Points and the triangles that join them. Triangle k is the points
+//   triangles[3k], triangles[3k + 1] and triangles[3k + 2], counterclockwise.
+//   halfedges[e] is the edge of the neighbouring triangle that runs the
+//   other way along edge e (edge e goes from triangles[e] to the next point
+//   of its triangle), or -1 on the outline. `hull` is the outline's points,
+//   counterclockwise. `used` says which points are in the triangulation
+//   (one of two points at the same place isn't).
+public struct Triangulation {
+    xs: [Float]
+    ys: [Float]
+    triangles: [Int] = []
+    halfedges: [Int] = []
+    hull: [Int] = []
+    used: [Bool] = []
+
+    // How many triangles there are.
+    fn count() -> Int {
+        triangles.count / 3
+    }
+
+    // The three points of triangle k, counterclockwise.
+    fn triangle(_ k: Int) -> (Int, Int, Int) {
+        (triangles[3 * k], triangles[3 * k + 1], triangles[3 * k + 2])
+    }
+
+    // Every edge once, as pairs of points: a, b, a, b, …
+    fn edges() -> [Int] {
+        var out: [Int] = []
+        for e in 0..triangles.count {
+            let twin = halfedges[e]
+            if twin < 0 || e < twin {
+                out.append(triangles[e])
+                out.append(triangles[nextEdge(e)])
+            }
+        }
+        out
+    }
+
+    // find(x, y, from:)
+    //   The triangle that (x, y) is in, or -1 outside the outline. A point
+    //   on an edge is in either triangle. The search walks from triangle
+    //   `from`: start it from the last answer when the points are near
+    //   each other, and it's quicker.
+    fn find(_ x: Float, _ y: Float, from: Int = 0) -> Int {
+        let n = count()
+        if n == 0 || x.isNaN || y.isNaN {
+            return -1
+        }
+        var t = if from >= 0 && from < n { from } else { 0 }
+        var steps = 0
+        // Walk towards the point, crossing the edge it's beyond.
+        while steps < 3 * n + 10 {
+            steps += 1
+            var moved = false
+            for k in 0..3 {
+                let e = 3 * t + k
+                let a = triangles[e]
+                let b = triangles[nextEdge(e)]
+                if orient(xs[a], ys[a], xs[b], ys[b], x, y) < 0.0 {
+                    let twin = halfedges[e]
+                    if twin < 0 {
+                        // Beyond the outline, which is convex: outside.
+                        return -1
+                    }
+                    t = twin / 3
+                    moved = true
+                    break
+                }
+            }
+            if !moved {
+                return t
+            }
+        }
+        // The walk went round (only with nearly flat triangles): look at
+        // every triangle.
+        for k in 0..n {
+            if inTriangle(k, x, y) {
+                return k
+            }
+        }
+        -1
+    }
+
+    fn inTriangle(_ k: Int, _ x: Float, _ y: Float) -> Bool {
+        let (a, b, c) = triangle(k)
+        orient(xs[a], ys[a], xs[b], ys[b], x, y) >= 0.0 && orient(xs[b], ys[b], xs[c], ys[c], x, y) >= 0.0 &&
+            orient(xs[c], ys[c], xs[a], ys[a], x, y) >= 0.0
+    }
+
+    // contains(x, y)
+    //   Whether (x, y) is inside the outline (or on it).
+    fn contains(_ x: Float, _ y: Float) -> Bool {
+        find(x, y) >= 0
+    }
+}
+
+// The edge after e in its triangle, and the one before.
+fn nextEdge(_ e: Int) -> Int {
+    if e % 3 == 2 { e - 2 } else { e + 1 }
+}
+
+fn prevEdge(_ e: Int) -> Int {
+    if e % 3 == 0 { e + 2 } else { e - 1 }
+}
+
+// Twice the signed area of triangle abc: positive when a, b, c turn
+// counterclockwise, negative clockwise, 0 in a line.
+fn orient(_ ax: Float, _ ay: Float, _ bx: Float, _ by: Float, _ cx: Float, _ cy: Float) -> Float {
+    (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+}
+
+// Whether d is inside the circle through a, b, c (counterclockwise), by
+// more than rounding: positive inside, negative outside, 0 too close to
+// tell.
+fn inCircle(_ ax: Float, _ ay: Float, _ bx: Float, _ by: Float, _ cx: Float, _ cy: Float,
+            _ dx: Float, _ dy: Float) -> Float {
+    let adx = ax - dx
+    let ady = ay - dy
+    let bdx = bx - dx
+    let bdy = by - dy
+    let cdx = cx - dx
+    let cdy = cy - dy
+    let ad = adx * adx + ady * ady
+    let bd = bdx * bdx + bdy * bdy
+    let cd = cdx * cdx + cdy * cdy
+    let det = adx * (bdy * cd - bd * cdy) - ady * (bdx * cd - bd * cdx) + ad * (bdx * cdy - bdy * cdx)
+    // How big the terms are, for telling a real answer from rounding.
+    let size = (abs(bdy * cd) + abs(bd * cdy)) * abs(adx) + (abs(bdx * cd) + abs(bd * cdx)) * abs(ady) +
+        (abs(bdx * cdy) + abs(bdy * cdx)) * ad
+    if abs(det) <= 1e-12 * size { 0.0 } else { det }
+}
+
+// The squared radius of the circle through three points (infinite when
+// they're in a line).
+fn circumradius2(_ ax: Float, _ ay: Float, _ bx: Float, _ by: Float, _ cx: Float, _ cy: Float) -> Float {
+    let dx = bx - ax
+    let dy = by - ay
+    let ex = cx - ax
+    let ey = cy - ay
+    let bl = dx * dx + dy * dy
+    let cl = ex * ex + ey * ey
+    let d = dx * ey - dy * ex
+    if d == 0.0 {
+        return 1.0 / 0.0
+    }
+    let x = (ey * bl - dy * cl) * 0.5 / d
+    let y = (dx * cl - ex * bl) * 0.5 / d
+    let r = x * x + y * y
+    if r.isFinite { r } else { 1.0 / 0.0 }
+}
+
+fn circumcenter(_ ax: Float, _ ay: Float, _ bx: Float, _ by: Float, _ cx: Float, _ cy: Float) -> (Float, Float) {
+    let dx = bx - ax
+    let dy = by - ay
+    let ex = cx - ax
+    let ey = cy - ay
+    let bl = dx * dx + dy * dy
+    let cl = ex * ex + ey * ey
+    let d = dx * ey - dy * ex
+    (ax + (ey * bl - dy * cl) * 0.5 / d, ay + (dx * cl - ex * bl) * 0.5 / d)
+}
+
+// An angle-like number from 0 to 1 that grows counterclockwise round the
+// origin, for the hull's hash.
+fn pseudoAngle(_ dx: Float, _ dy: Float) -> Float {
+    let s = abs(dx) + abs(dy)
+    if s == 0.0 {
+        return 0.0
+    }
+    let p = dx / s
+    (if dy > 0.0 { 3.0 - p } else { 1.0 + p }) / 4.0
+}
+
+// The triangles while they're built.
+struct Builder {
+    xs: [Float]
+    ys: [Float]
+    triangles: [Int] = []
+    halfedges: [Int] = []
+
+    fn link(_ a: Int, _ b: Int) {
+        if a >= 0 {
+            halfedges[a] = b
+        }
+        if b >= 0 {
+            halfedges[b] = a
+        }
+    }
+
+    // Adds triangle i0 i1 i2 (counterclockwise), whose edges' neighbours
+    // are a, b and c (or -1). Gives its first edge.
+    fn add(_ i0: Int, _ i1: Int, _ i2: Int, _ a: Int, _ b: Int, _ c: Int) -> Int {
+        let t = triangles.count
+        triangles.append(i0)
+        triangles.append(i1)
+        triangles.append(i2)
+        halfedges.append(-1)
+        halfedges.append(-1)
+        halfedges.append(-1)
+        link(t, a)
+        link(t + 1, b)
+        link(t + 2, c)
+        t
+    }
+
+    // Flips edge a (and its twin) to join the two other points.
+    fn flip(_ a: Int) {
+        let b = halfedges[a]
+        let p0 = triangles[a]
+        let p1 = triangles[nextEdge(a)]
+        let pl = triangles[prevEdge(a)]
+        let pr = triangles[prevEdge(b)]
+        let hb1 = halfedges[nextEdge(b)]
+        let hb2 = halfedges[prevEdge(b)]
+        let ha1 = halfedges[nextEdge(a)]
+        let ha2 = halfedges[prevEdge(a)]
+        let a0 = a - a % 3
+        let b0 = b - b % 3
+        // A becomes p0 pr pl, B becomes pr p1 pl.
+        triangles[a0] = p0
+        triangles[a0 + 1] = pr
+        triangles[a0 + 2] = pl
+        triangles[b0] = pr
+        triangles[b0 + 1] = p1
+        triangles[b0 + 2] = pl
+        link(a0, hb1)
+        link(a0 + 1, b0 + 2)
+        link(a0 + 2, ha2)
+        link(b0, hb2)
+        link(b0 + 1, ha1)
+    }
+
+    // The edge from point u to point v among the edges of the triangles
+    // of edges a and b, or -1.
+    fn edgeAmong(_ a: Int, _ b: Int, _ u: Int, _ v: Int) -> Int {
+        for t in [a - a % 3, b - b % 3] {
+            for k in 0..3 {
+                let e = t + k
+                if triangles[e] == u && triangles[nextEdge(e)] == v {
+                    return e
+                }
+            }
+        }
+        -1
+    }
+
+    // Puts point p inside triangle t, making three triangles of it.
+    fn insertInside(_ t: Int, _ p: Int) {
+        let t0 = 3 * t
+        let a = triangles[t0]
+        let bb = triangles[t0 + 1]
+        let c = triangles[t0 + 2]
+        let hb = halfedges[t0 + 1]
+        let hc = halfedges[t0 + 2]
+        // t becomes a b p; then b c p and c a p.
+        triangles[t0 + 2] = p
+        halfedges[t0 + 1] = -1
+        halfedges[t0 + 2] = -1
+        let t1 = add(bb, c, p, hb, -1, t0 + 1)
+        let _t2 = add(c, a, p, hc, t0 + 2, t1 + 1)
+    }
+
+    // The triangle (x, y) is in (on its edges too), or -1: by looking at
+    // every triangle, for the rare point the sweep can't place.
+    fn containing(_ x: Float, _ y: Float) -> Int {
+        var t = 0
+        while 3 * t < triangles.count {
+            let a = triangles[3 * t]
+            let bb = triangles[3 * t + 1]
+            let c = triangles[3 * t + 2]
+            if orient(xs[a], ys[a], xs[bb], ys[bb], x, y) >= 0.0 && orient(xs[bb], ys[bb], xs[c], ys[c], x, y) >= 0.0 &&
+                orient(xs[c], ys[c], xs[a], ys[a], x, y) >= 0.0 {
+                return t
+            }
+            t += 1
+        }
+        -1
+    }
+
+    // Whether (x, y) is at a corner of triangle t.
+    fn isCorner(_ t: Int, _ x: Float, _ y: Float) -> Bool {
+        for k in 0..3 {
+            let v = triangles[3 * t + k]
+            if xs[v] == x && ys[v] == y {
+                return true
+            }
+        }
+        false
+    }
+
+    // Flips edges until every pair of triangles passes the circle test.
+    fn legalize() {
+        var stack: [Int] = []
+        for e in 0..halfedges.count {
+            if halfedges[e] > e {
+                stack.append(e)
+            }
+        }
+        var flips = 0
+        let most = 50 * triangles.count + 1000
+        while !stack.isEmpty && flips < most {
+            let a = stack.removeLast()
+            let b = halfedges[a]
+            if b < 0 {
+                continue
+            }
+            // Triangle A is p0 p1 pl (a runs p0 to p1); B is p1 p0 pr.
+            let p0 = triangles[a]
+            let p1 = triangles[nextEdge(a)]
+            let pl = triangles[prevEdge(a)]
+            let pr = triangles[prevEdge(b)]
+            if inCircle(xs[p0], ys[p0], xs[p1], ys[p1], xs[pl], ys[pl], xs[pr], ys[pr]) <= 0.0 {
+                continue
+            }
+            // The new edge pl–pr.
+            let a0 = a - a % 3
+            let b0 = b - b % 3
+            flip(a)
+            flips += 1
+            stack.append(a0)
+            stack.append(a0 + 2)
+            stack.append(b0)
+            stack.append(b0 + 1)
+        }
+    }
+}
+
+// The hull edge (from a point to the next) that (x, y) lies on, between
+// its ends, or nil.
+fn hullEdgeThrough(_ xs: [Float], _ ys: [Float], _ x: Float, _ y: Float, _ start: Int, _ next: [Int]) -> (Int, Int)? {
+    var h = start
+    var steps = 0
+    while steps <= next.count {
+        steps += 1
+        let q = next[h]
+        let ax = xs[h]
+        let ay = ys[h]
+        let bx = xs[q]
+        let by = ys[q]
+        let o = orient(ax, ay, bx, by, x, y)
+        let len2 = (bx - ax) * (bx - ax) + (by - ay) * (by - ay)
+        // On the line (to rounding) and strictly between the ends.
+        let along = (x - ax) * (bx - ax) + (y - ay) * (by - ay)
+        if abs(o) <= 1e-12 * len2 && along > 0.0 && along < len2 {
+            return (h, q)
+        }
+        h = q
+        if h == start {
+            break
+        }
+    }
+    nil
+}
+
+// triangulate(xs, ys)
+//   The Delaunay triangulation of the points (x, y). Points in a line give
+//   no triangles; a point at the same place as another is left out (see
+//   `used`).
+//
+//   let t = interpolate.triangulate([0, 4, 0, 4, 2], [0, 0, 3, 3, 1])
+//   print(t.count())          // 4
+public fn triangulate(_ xs: [Float], _ ys: [Float]) -> Triangulation {
+    if xs.count != ys.count {
+        fail("triangulate: {xs.count} x values but {ys.count} y values")
+    }
+    let n = xs.count
+    for k in 0..n {
+        if !xs[k].isFinite || !ys[k].isFinite {
+            fail("triangulate: point {k + 1} is ({xs[k]}, {ys[k]})")
+        }
+    }
+    var used: [Bool] = []
+    for _ in 0..n {
+        used.append(false)
+    }
+    if n < 3 {
+        return Triangulation(xs: xs, ys: ys, hull: [], used: used)
+    }
+    // A first triangle near the middle: the point nearest the middle of
+    // the box, the point nearest that, and the point making the smallest
+    // circle with them.
+    var minX = xs[0]
+    var maxX = xs[0]
+    var minY = ys[0]
+    var maxY = ys[0]
+    for k in 0..n {
+        minX = min(minX, xs[k])
+        maxX = max(maxX, xs[k])
+        minY = min(minY, ys[k])
+        maxY = max(maxY, ys[k])
+    }
+    let mx = (minX + maxX) / 2.0
+    let my = (minY + maxY) / 2.0
+    var i0 = 0
+    var best = 1.0 / 0.0
+    for k in 0..n {
+        let d = (xs[k] - mx) * (xs[k] - mx) + (ys[k] - my) * (ys[k] - my)
+        if d < best {
+            best = d
+            i0 = k
+        }
+    }
+    var i1 = -1
+    best = 1.0 / 0.0
+    for k in 0..n {
+        let d = (xs[k] - xs[i0]) * (xs[k] - xs[i0]) + (ys[k] - ys[i0]) * (ys[k] - ys[i0])
+        if k != i0 && d > 0.0 && d < best {
+            best = d
+            i1 = k
+        }
+    }
+    if i1 < 0 {
+        // Every point at one place.
+        used[i0] = true
+        return Triangulation(xs: xs, ys: ys, hull: [i0], used: used)
+    }
+    var i2 = -1
+    best = 1.0 / 0.0
+    for k in 0..n {
+        if k == i0 || k == i1 {
+            continue
+        }
+        let r = circumradius2(xs[i0], ys[i0], xs[i1], ys[i1], xs[k], ys[k])
+        if r < best {
+            best = r
+            i2 = k
+        }
+    }
+    if i2 < 0 {
+        // All in a line: no triangles. The outline is the two ends.
+        var lo = 0
+        var hi = 0
+        let dx = xs[i1] - xs[i0]
+        let dy = ys[i1] - ys[i0]
+        for k in 0..n {
+            let s = (xs[k] - xs[i0]) * dx + (ys[k] - ys[i0]) * dy
+            if s < (xs[lo] - xs[i0]) * dx + (ys[lo] - ys[i0]) * dy {
+                lo = k
+            }
+            if s > (xs[hi] - xs[i0]) * dx + (ys[hi] - ys[i0]) * dy {
+                hi = k
+            }
+        }
+        return Triangulation(xs: xs, ys: ys, hull: [lo, hi], used: used)
+    }
+    if orient(xs[i0], ys[i0], xs[i1], ys[i1], xs[i2], ys[i2]) < 0.0 {
+        let t = i1
+        i1 = i2
+        i2 = t
+    }
+    let (cx, cy) = circumcenter(xs[i0], ys[i0], xs[i1], ys[i1], xs[i2], ys[i2])
+
+    // The other points in order of distance from the circle's middle.
+    var dists: [Float] = []
+    for k in 0..n {
+        dists.append((xs[k] - cx) * (xs[k] - cx) + (ys[k] - cy) * (ys[k] - cy))
+    }
+    var ids: [Int] = []
+    for k in 0..n {
+        ids.append(k)
+    }
+    let order = ids.sorted { a, b in dists[a] < dists[b] || (dists[a] == dists[b] && a < b) }
+
+    var b = Builder(xs: xs, ys: ys)
+    // The hull, counterclockwise: next and previous point, and the edge of
+    // the triangle inside each hull edge (from the point to the next).
+    var hullNext: [Int] = []
+    var hullPrev: [Int] = []
+    var hullTri: [Int] = []
+    for _ in 0..n {
+        hullNext.append(-1)
+        hullPrev.append(-1)
+        hullTri.append(-1)
+    }
+    let hashSize = max(1, Int(ceil(sqrt(Float(n)))))
+    var hullHash: [Int] = []
+    for _ in 0..hashSize {
+        hullHash.append(-1)
+    }
+    let t0 = b.add(i0, i1, i2, -1, -1, -1)
+    hullNext[i0] = i1
+    hullNext[i1] = i2
+    hullNext[i2] = i0
+    hullPrev[i1] = i0
+    hullPrev[i2] = i1
+    hullPrev[i0] = i2
+    hullTri[i0] = t0
+    hullTri[i1] = t0 + 1
+    hullTri[i2] = t0 + 2
+    for p in [i0, i1, i2] {
+        let key = Int(floor(pseudoAngle(xs[p] - cx, ys[p] - cy) * Float(hashSize))) % hashSize
+        hullHash[key] = p
+        used[p] = true
+    }
+    var hullStart = i0
+    var lastX = 0.0 / 0.0
+    var lastY = 0.0 / 0.0
+    for p in order {
+        let x = xs[p]
+        let y = ys[p]
+        if p == i0 || p == i1 || p == i2 {
+            continue
+        }
+        // The same place as the point before.
+        if x == lastX && y == lastY {
+            continue
+        }
+        lastX = x
+        lastY = y
+        // A hull point near p's direction to start from.
+        let key = Int(floor(pseudoAngle(x - cx, y - cy) * Float(hashSize))) % hashSize
+        var start = -1
+        for j in 0..hashSize {
+            let s = hullHash[(key + j) % hashSize]
+            if s >= 0 && hullNext[s] != s {
+                start = s
+                break
+            }
+        }
+        if start < 0 {
+            continue
+        }
+        start = hullPrev[start]
+        // The first hull edge e→q that p sees (p to its right).
+        var e = start
+        var found = true
+        while orient(xs[e], ys[e], xs[hullNext[e]], ys[hullNext[e]], x, y) >= 0.0 {
+            e = hullNext[e]
+            if e == start {
+                found = false
+                break
+            }
+        }
+        if !found {
+            // Not outside the hull: on one of its edges (points in a row
+            // along the outline), or just inside it by rounding.
+            if let (h, hq) = hullEdgeThrough(xs, ys, x, y, hullStart, hullNext) {
+                // Split the hull edge h→hq at p.
+                used[p] = true
+                let tri = b.add(h, p, hq, -1, -1, hullTri[h])
+                b.flip(tri + 2)
+                let other = b.halfedges[tri + 2]
+                hullTri[h] = b.edgeAmong(tri, other, h, p)
+                hullTri[p] = b.edgeAmong(tri, other, p, hq)
+                hullNext[h] = p
+                hullPrev[p] = h
+                hullNext[p] = hq
+                hullPrev[hq] = p
+                hullHash[key] = p
+                hullStart = p
+            } else {
+                let inside = b.containing(x, y)
+                if inside >= 0 && !b.isCorner(inside, x, y) {
+                    used[p] = true
+                    b.insertInside(inside, p)
+                }
+            }
+            continue
+        }
+        used[p] = true
+        var q = hullNext[e]
+        let first = b.add(e, p, q, -1, -1, hullTri[e])
+        // Forward: more edges p sees after q.
+        var pq = first + 1
+        var nx = hullNext[q]
+        while orient(xs[q], ys[q], xs[nx], ys[nx], x, y) < 0.0 {
+            let t = b.add(q, p, nx, pq, -1, hullTri[q])
+            hullNext[q] = q
+            q = nx
+            nx = hullNext[q]
+            pq = t + 1
+        }
+        // Backward: edges p sees before e.
+        var ep = first
+        var pv = hullPrev[e]
+        while orient(xs[pv], ys[pv], xs[e], ys[e], x, y) < 0.0 {
+            let t = b.add(pv, p, e, -1, ep, hullTri[pv])
+            hullNext[e] = e
+            e = pv
+            pv = hullPrev[e]
+            ep = t
+        }
+        hullNext[e] = p
+        hullPrev[p] = e
+        hullNext[p] = q
+        hullPrev[q] = p
+        hullTri[e] = ep
+        hullTri[p] = pq
+        hullHash[key] = p
+        let ek = Int(floor(pseudoAngle(xs[e] - cx, ys[e] - cy) * Float(hashSize))) % hashSize
+        hullHash[ek] = e
+        hullStart = p
+    }
+    b.legalize()
+    var hull: [Int] = [hullStart]
+    var v = hullNext[hullStart]
+    while v != hullStart && hull.count <= n {
+        hull.append(v)
+        v = hullNext[v]
+    }
+    Triangulation(xs: xs, ys: ys, triangles: b.triangles, halfedges: b.halfedges, hull: hull, used: used)
+}

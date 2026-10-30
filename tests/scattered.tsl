@@ -1,0 +1,450 @@
+// interpolate's tests for scattered points: triangulations, tin, nearest,
+// idw, rbf and contours checked against SciPy, NumPy and Matplotlib (the
+// cases in scattered.json, made by tools/oracle/scattered.py), then by hand.
+//
+// Author: Alexius Academia
+// Date: 2026-10-30
+
+import ".."
+
+struct ContourCase {
+    level: Float
+    lines: Int
+    closed: Int
+    length: Float
+}
+
+struct TriCase {
+    kind: String
+    xs: [Float]
+    ys: [Float]
+    zs: [Float]
+    triangles: [[Int]]
+    hull: [Int]
+    qx: [Float]
+    qy: [Float]
+    linear: [Float]
+    nearest: [Float]
+    power: Float
+    radius: Float
+    neighbours: Int
+    idw: [Float]
+    contours: [ContourCase]
+}
+
+struct RbfCase {
+    kind: String
+    xs: [Float]
+    ys: [Float]
+    zs: [Float]
+    kernel: String
+    epsilon: Float
+    smoothing: Float
+    degree: Int
+    qx: [Float]
+    qy: [Float]
+    values: [Float]
+}
+
+struct ScatteredCases {
+    triangulations: [TriCase]
+    rbf: [RbfCase]
+}
+
+fn kernelOf(_ s: String) -> interpolate.Kernel {
+    match s {
+        "linear" -> .linear
+        "cubic" -> .cubic
+        "quintic" -> .quintic
+        "multiquadric" -> .multiquadric
+        "inverseMultiquadric" -> .inverseMultiquadric
+        "inverseQuadratic" -> .inverseQuadratic
+        "gaussian" -> .gaussian
+        _ -> .thinPlate
+    }
+}
+
+// The triangles as sorted triples, sorted.
+fn tripleKeys(_ t: interpolate.Triangulation) -> [String] {
+    var out: [String] = []
+    for k in 0..t.count() {
+        let (a, b, c) = t.triangle(k)
+        let s = [a, b, c].sorted()
+        out.append("{s[0]},{s[1]},{s[2]}")
+    }
+    out.sorted()
+}
+
+// Whether two values agree to `rel` of `scale` (NaN agrees with NaN).
+fn agrees(_ got: Float, _ want0: Float, _ scale: Float, _ rel: Float) -> Bool {
+    let want = decoded(want0)
+    if want.isNaN || got.isNaN {
+        return want.isNaN && got.isNaN
+    }
+    abs(got - want) <= rel * max(scale, 1.0)
+}
+
+fn spread(_ zs: [Float]) -> Float {
+    var lo = zs[0]
+    var hi = zs[0]
+    for z in zs {
+        lo = min(lo, z)
+        hi = max(hi, z)
+    }
+    max(hi - lo, max(abs(lo), abs(hi)))
+}
+
+fn lineLength(_ c: interpolate.Contour) -> Float {
+    var total = 0.0
+    let n = c.points.count / 2
+    for k in 1..n {
+        total += hypot2(c.points[2 * k] - c.points[2 * k - 2], c.points[2 * k + 1] - c.points[2 * k - 1])
+    }
+    if c.closed && n > 1 {
+        total += hypot2(c.points[0] - c.points[2 * n - 2], c.points[1] - c.points[2 * n - 1])
+    }
+    total
+}
+
+fn hypot2(_ a: Float, _ b: Float) -> Float {
+    sqrt(a * a + b * b)
+}
+
+fn scatteredOracle() -> Int {
+    let text = readFile("tests/scattered.json") ?? ""
+    let loaded: ScatteredCases? = fromJson(text)
+    if loaded == nil {
+        print("FAIL  tests/scattered.json can't be read: run from the library's folder")
+        return 1
+    }
+    let cases = loaded ?? ScatteredCases(triangulations: [], rbf: [])
+    var failed = 0
+    var checks = 0
+    for (n, c) in cases.triangulations.enumerated() {
+        let name = "scattered case {n + 1} ({c.kind}, {c.xs.count} points)"
+        let t = interpolate.triangulate(c.xs, c.ys)
+        var want: [String] = []
+        for tri in c.triangles {
+            want.append("{tri[0]},{tri[1]},{tri[2]}")
+        }
+        checks += 1
+        if tripleKeys(t) != want.sorted() {
+            failed += 1
+            if failed <= 2000 {
+                print("FAIL  {name}: {t.count()} triangles, SciPy has {c.triangles.count}, or they differ")
+            }
+        }
+        checks += 1
+        if t.hull.sorted() != c.hull {
+            failed += 1
+            if failed <= 2000 {
+                print("FAIL  {name}: hull {t.hull.sorted()}, SciPy's {c.hull}")
+            }
+        }
+        let scale = spread(c.zs)
+        let lin = interpolate.tin(c.xs, c.ys, c.zs).values(c.qx, c.qy)
+        let near = interpolate.nearest(c.xs, c.ys, c.zs).values(c.qx, c.qy)
+        let idw = interpolate.idw(c.xs, c.ys, c.zs, power: c.power, radius: c.radius, neighbours: c.neighbours).values(c.qx, c.qy)
+        for k in 0..c.qx.count {
+            let rows: [(String, Float, Float)] = [("tin", lin[k], c.linear[k]), ("nearest", near[k], c.nearest[k]), ("idw", idw[k], c.idw[k])]
+            for (what, got, want) in rows {
+                checks += 1
+                if !agrees(got, want, scale, 1e-9) {
+                    failed += 1
+                    if failed <= 2000 {
+                        print("FAIL  {name}: {what} at ({c.qx[k]}, {c.qy[k]}) is {got}, want {decoded(want)}")
+                    }
+                }
+            }
+        }
+        let surface = interpolate.tin(c.xs, c.ys, c.zs)
+        for cc in c.contours {
+            let lines = surface.contours([cc.level])
+            var total = 0.0
+            var closed = 0
+            for l in lines {
+                total += lineLength(l)
+                if l.closed {
+                    closed += 1
+                }
+            }
+            checks += 1
+            if lines.count != cc.lines || closed != cc.closed || abs(total - cc.length) > 1e-9 * max(cc.length, 1.0) {
+                failed += 1
+                if failed <= 2000 {
+                    print("FAIL  {name}: contour {cc.level}: {lines.count} lines ({closed} closed), {total} long; Matplotlib {cc.lines} ({cc.closed}), {cc.length}")
+                }
+            }
+        }
+    }
+    for (n, c) in cases.rbf.enumerated() {
+        let name = "rbf case {n + 1} ({c.kernel}, {c.kind}, {c.xs.count} points, smoothing {c.smoothing}, degree {c.degree})"
+        let s = interpolate.rbf(c.xs, c.ys, c.zs, kernel: kernelOf(c.kernel), epsilon: c.epsilon, smoothing: c.smoothing,
+                                degree: c.degree)
+        let got = s.values(c.qx, c.qy)
+        let scale = spread(c.zs)
+        for k in 0..c.qx.count {
+            checks += 1
+            if !agrees(got[k], c.values[k], scale, 1e-6) {
+                failed += 1
+                if failed <= 2000 {
+                    print("FAIL  {name}: at ({c.qx[k]}, {c.qy[k]}) {got[k]}, SciPy {c.values[k]}")
+                }
+            }
+        }
+    }
+    print("{if failed == 0 { "ok   " } else { "FAIL " }} scattered points: {checks - failed} of {checks} checks agree with SciPy, NumPy and Matplotlib")
+    failed
+}
+
+// Whether no point lies inside any triangle's circumcircle (by more than
+// rounding), checked against every point.
+fn isDelaunay(_ t: interpolate.Triangulation) -> Bool {
+    for k in 0..t.count() {
+        let (a, b, c) = t.triangle(k)
+        let ax = t.xs[a]
+        let ay = t.ys[a]
+        let bx = t.xs[b]
+        let by = t.ys[b]
+        let cx = t.xs[c]
+        let cy = t.ys[c]
+        for p in 0..t.xs.count {
+            if !t.used[p] || p == a || p == b || p == c {
+                continue
+            }
+            let dx = t.xs[p]
+            let dy = t.ys[p]
+            let adx = ax - dx
+            let ady = ay - dy
+            let bdx = bx - dx
+            let bdy = by - dy
+            let cdx = cx - dx
+            let cdy = cy - dy
+            let det = (adx * adx + ady * ady) * (bdx * cdy - cdx * bdy) - (bdx * bdx + bdy * bdy) * (adx * cdy - cdx * ady) +
+                (cdx * cdx + cdy * cdy) * (adx * bdy - bdx * ady)
+            let size = (adx * adx + ady * ady + bdx * bdx + bdy * bdy + cdx * cdx + cdy * cdy)
+            if det > 1e-9 * size * size {
+                return false
+            }
+        }
+    }
+    true
+}
+
+// The signed area of a closed contour: positive counterclockwise.
+fn signedArea(_ c: interpolate.Contour) -> Float {
+    let n = c.points.count / 2
+    var s = 0.0
+    for k in 0..n {
+        let j = (k + 1) % n
+        s += c.points[2 * k] * c.points[2 * j + 1] - c.points[2 * j] * c.points[2 * k + 1]
+    }
+    s / 2.0
+}
+
+fn gridPoints(_ side: Int, _ step: Float) -> ([Float], [Float]) {
+    var xs: [Float] = []
+    var ys: [Float] = []
+    for i in 0..side {
+        for j in 0..side {
+            xs.append(Float(i) * step)
+            ys.append(Float(j) * step)
+        }
+    }
+    (xs, ys)
+}
+
+fn scatteredByHand() -> Int {
+    var failed = 0
+    // A grid: four points on every circle, so the triangulation isn't
+    // unique, and rows of points along the outline.
+    let (gx, gy) = gridPoints(6, 10.0)
+    let g = interpolate.triangulate(gx, gy)
+    failed += holds("grid: every point used", g.used.all { u in u })
+    failed += holds("grid: 2n - 2 - h triangles ({g.count()})", g.count() == 2 * 36 - 2 - 20)
+    failed += holds("grid: the outline has all 20 edge points", g.hull.count == 20)
+    failed += holds("grid: Delaunay (empty circles)", isDelaunay(g))
+    // A plane is the same whichever diagonals were chosen.
+    var gz: [Float] = []
+    for k in 0..gx.count {
+        gz.append(2.0 * gx[k] - 3.0 * gy[k] + 7.0)
+    }
+    let plane = interpolate.tin(gx, gy, gz)
+    var planeOk = true
+    for k in 0..200 {
+        let x = Float(k % 20) * 2.6 + 0.3
+        let y = Float(k / 20) * 5.1 + 0.2
+        if !close(plane.at(x, y), 2.0 * x - 3.0 * y + 7.0) {
+            planeOk = false
+        }
+    }
+    failed += holds("tin reproduces a plane exactly", planeOk)
+    failed += holds("tin goes through its points", close(plane.at(30, 40), gz[3 * 6 + 4]))
+    failed += holds("tin is NaN outside", plane.at(-1, 5).isNaN && plane.at(25, 51).isNaN)
+    let held = interpolate.tin(gx, gy, gz, beyond: .nearest)
+    failed += holds("tin beyond: .nearest", close(held.at(-3, 21), gz[2]) && close(held.at(53, 52), gz[35]))
+    failed += holds("a point on an edge", close(plane.at(5, 0), 17.0) && close(plane.at(50, 25), 32.0))
+
+    // Random points, many on a circle, with points repeated.
+    var rx: [Float] = []
+    var ry: [Float] = []
+    for k in 0..400 {
+        let a = Float(k) * 0.37
+        rx.append(50.0 + 40.0 * cos(a) * (if k % 3 == 0 { 1.0 } else { Float((k * 7919) % 97) / 97.0 }))
+        ry.append(50.0 + 40.0 * sin(a) * (if k % 3 == 0 { 1.0 } else { Float((k * 7919) % 97) / 97.0 }))
+    }
+    rx.append(rx[10])
+    ry.append(ry[10])
+    rx.append(rx[11])
+    ry.append(ry[11])
+    let r = interpolate.triangulate(rx, ry)
+    var places: Set<String> = []
+    for k in 0..rx.count {
+        places.insert("{rx[k]},{ry[k]}")
+    }
+    failed += holds("every place used once ({places.count} of {rx.count} points)", r.used.count { u in u } == places.count)
+    failed += holds("random points on a circle: Delaunay", isDelaunay(r))
+    failed += holds("find: a point inside", r.find(50.0, 50.0) >= 0 && r.contains(50.0, 50.0))
+    failed += holds("find: a point outside", r.find(500.0, 50.0) == -1 && !r.contains(-500.0, 0.0))
+    failed += holds("edges: each once", r.edges().count / 2 == (3 * r.count() + r.hull.count) / 2)
+
+    // Points in a line, and points at one place.
+    let line = interpolate.triangulate([0, 1, 2, 3, 4], [0, 2, 4, 6, 8])
+    failed += holds("points in a line: no triangles, the ends as outline", line.count() == 0 && line.hull.sorted() == [0, 4])
+    let one = interpolate.triangulate([2, 2, 2], [5, 5, 5])
+    failed += holds("points at one place: no triangles", one.count() == 0 && one.hull == [0])
+    let three = interpolate.triangulate([0, 4, 0], [0, 0, 3])
+    failed += holds("three points: one counterclockwise triangle", three.count() == 1 && three.hull.count == 3)
+
+    // Points at the same place are merged with their mean value.
+    let m = interpolate.tin([0, 10, 0, 0], [0, 0, 10, 0], [1, 2, 3, 5])
+    failed += holds("tin: repeated points take the mean", close(m.at(0, 0), 3.0))
+    failed += holds("nearest: repeated points take the mean", close(interpolate.nearest([0, 0, 9], [0, 0, 9], [2, 4, 7]).at(1, 1), 3.0))
+    failed += holds("rbf: repeated points don't break the system", close(interpolate.rbf([0, 10, 0, 10, 0], [0, 0, 10, 10, 0], [1, 2, 3, 4, 1]).at(10, 10), 4.0))
+
+    // Inverse distance weighting.
+    let ix: [Float] = [0, 10, 0, 10]
+    let iy: [Float] = [0, 0, 10, 10]
+    let iz: [Float] = [1, 2, 3, 4]
+    let idw = interpolate.idw(ix, iy, iz)
+    failed += holds("idw: the middle is the mean", close(idw.at(5, 5), 2.5))
+    failed += holds("idw: exact at a point", close(idw.at(10, 0), 2.0))
+    failed += holds("idw: weights 1/d²", close(idw.at(2, 0), (1.0 / 4.0 + 2.0 / 64.0 + 3.0 / 104.0 + 4.0 / 164.0) / (1.0 / 4.0 + 1.0 / 64.0 + 1.0 / 104.0 + 1.0 / 164.0)))
+    failed += holds("idw: power 1", close(interpolate.idw(ix, iy, iz, power: 1.0).at(2, 0), (1.0 / 2.0 + 2.0 / 8.0 + 3.0 / sqrt(104.0) + 4.0 / sqrt(164.0)) / (1.0 / 2.0 + 1.0 / 8.0 + 1.0 / sqrt(104.0) + 1.0 / sqrt(164.0))))
+    let near = interpolate.idw(ix, iy, iz, radius: 3.0)
+    failed += holds("idw: radius keeps near points only", close(near.at(1, 1), 1.0) && near.at(5, 5).isNaN)
+    failed += holds("idw: neighbours", close(interpolate.idw(ix, iy, iz, neighbours: 1).at(9, 8), 4.0))
+
+    // Smooth surfaces.
+    let sx: [Float] = [0, 10, 0, 10, 5, 3, 7]
+    let sy: [Float] = [0, 0, 10, 10, 5, 8, 2]
+    let sz: [Float] = [1, 2, 3, 4, 6, 3.5, 1.5]
+    let tps = interpolate.rbf(sx, sy, sz)
+    var exact = true
+    for k in 0..sx.count {
+        if abs(tps.at(sx[k], sy[k]) - sz[k]) > 1e-9 {
+            exact = false
+        }
+    }
+    failed += holds("rbf goes through its points", exact)
+    let smooth = interpolate.rbf(sx, sy, sz, smoothing: 50.0)
+    failed += holds("rbf smoothing lets it miss them", abs(smooth.at(5, 5) - 6.0) > 0.5)
+    let planeFit = interpolate.rbf(gx, gy, gz)
+    failed += holds("rbf with degree 1 reproduces a plane", close(planeFit.at(13, 27), 2.0 * 13.0 - 3.0 * 27.0 + 7.0))
+    failed += holds("rbf gaussian", interpolate.rbf(sx, sy, sz, kernel: .gaussian, epsilon: 0.3).at(5, 5) == interpolate.rbf(sx, sy, sz, kernel: .gaussian, epsilon: 0.3).at(5, 5))
+
+    // Grids from scattered points.
+    let filled = plane.onGrid(xs: [0, 12.5, 25, 50], ys: [0, 10, 33])
+    failed += holds("onGrid fills a Grid", close(filled.zs[1][2], 2.0 * 12.5 - 3.0 * 33.0 + 7.0) && close(filled.at(20, 20), 2.0 * 20.0 - 3.0 * 20.0 + 7.0))
+    failed += holds("onGrid: NaN outside the outline", plane.onGrid(xs: [-5, 5], ys: [0, 5]).zs[0][0].isNaN)
+
+    // Contours of a hill: closed loops, counterclockwise (higher inside, on
+    // the left).
+    var hx: [Float] = []
+    var hy: [Float] = []
+    var hz: [Float] = []
+    for i in 0..21 {
+        for j in 0..21 {
+            let x = Float(i) - 10.0
+            let y = Float(j) - 10.0
+            hx.append(x)
+            hy.append(y)
+            hz.append(100.0 - x * x - y * y)
+        }
+    }
+    let hill = interpolate.tin(hx, hy, hz)
+    let rings = hill.contours([50.0, 90.0])
+    failed += holds("a hill: one closed ring at each level", rings.count == 2 && rings.all { c in c.closed })
+    failed += holds("rings go counterclockwise round the top", rings.all { c in signedArea(c) > 0.0 })
+    failed += holds("ring at 90 is round, radius about 3.16", abs(sqrt(signedArea(rings[1]) / pi) - sqrt(10.0)) < 0.2)
+    // A hollow goes clockwise.
+    let hollow = interpolate.tin(hx, hy, hz.map { z in -z })
+    failed += holds("rings round a hollow go clockwise", hollow.contours([-50.0]).all { c in c.closed && signedArea(c) < 0.0 })
+    // Every point of a line is at its level.
+    var onLevel = true
+    for c in hill.contours([33.3, 66.6]) {
+        for k in 0..(c.points.count / 2) {
+            if abs(hill.at(c.points[2 * k], c.points[2 * k + 1]) - c.level) > 1e-9 {
+                onLevel = false
+            }
+        }
+    }
+    failed += holds("contour points are at their level", onLevel)
+    // A level through points exactly (the grid's 99s and 96s) still makes
+    // one whole ring.
+    failed += holds("a level through points makes whole rings", hill.contours([99.0, 96.0]).all { c in c.closed } && hill.contours([99.0]).count == 1)
+    // An open line across a slope, from edge to edge.
+    let slope = plane.contours([0.0])
+    failed += holds("a slope: one open line", slope.count == 1 && !slope[0].closed)
+    failed += holds("no line above the top", hill.contours([200.0]).isEmpty)
+    let t = interpolate.triangulate(hx, hy)
+    failed += holds("contours(t, zs, levels:) as Surface.contours", interpolate.contours(t, hz, levels: [50.0]).count == 1)
+    failed += holds("levelsBetween", interpolate.levelsBetween(97.3, 112.0, step: 5.0) == [100.0, 105.0, 110.0])
+    failed += holds("levelsBetween with ends on steps", interpolate.levelsBetween(-10.0, 10.0, step: 10.0) == [-10.0, 0.0, 10.0])
+
+    // Checking points first.
+    failed += holds("scatteredProblem: counts", (interpolate.scatteredProblem([1, 2], [1], [1, 2]) ?? "").contains("2 x values, 1 y values"))
+    failed += holds("scatteredProblem: none", (interpolate.scatteredProblem([], [], []) ?? "").contains("no points"))
+    failed += holds("scatteredProblem: NaN", (interpolate.scatteredProblem([1, 0.0 / 0.0], [1, 2], [1, 2]) ?? "").contains("point 2"))
+    failed += holds("scatteredProblem: a value", (interpolate.scatteredProblem([1, 2], [1, 2], [1, 1.0 / 0.0]) ?? "").contains("the value at point 2"))
+    failed += holds("scatteredProblem: fine", interpolate.scatteredProblem([1, 2], [1, 2], [1, 2]) == nil)
+    failed
+}
+
+fn scatteredSpeed() -> Int {
+    var xs: [Float] = []
+    var ys: [Float] = []
+    var zs: [Float] = []
+    var seed = 12345
+    for _ in 0..20000 {
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let x = Float(seed % 100000) / 100.0
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        let y = Float(seed % 100000) / 100.0
+        xs.append(500000.0 + x)
+        ys.append(1600000.0 + y)
+        zs.append(sin(x / 50.0) * cos(y / 70.0) * 10.0 + 100.0)
+    }
+    let t0 = now()
+    let s = interpolate.tin(xs, ys, zs)
+    let built = now() - t0
+    var qx: [Float] = []
+    var qy: [Float] = []
+    for k in 0..100000 {
+        qx.append(500000.0 + Float(k % 400) * 2.5)
+        qy.append(1600000.0 + Float(k / 400) * 4.0)
+    }
+    let t1 = now()
+    let v = s.values(qx, qy)
+    let looked = now() - t1
+    let t2 = now()
+    let lines = s.contours(interpolate.levelsBetween(90.0, 110.0, step: 2.0))
+    let traced = now() - t2
+    let t3 = now()
+    let sub = 500
+    let r = interpolate.rbf(xs.prefix(sub), ys.prefix(sub), zs.prefix(sub))
+    let solved = now() - t3
+    var failed = holds("20 000 points (UTM-sized) triangulated in {built.formatted(decimals: 2)} s; 100 000 values in {looked.formatted(decimals: 2)} s; {lines.count} contour lines in {traced.formatted(decimals: 2)} s", v.count == 100000 && built < 60.0)
+    failed += holds("a {sub}-point thin-plate spline solved in {solved.formatted(decimals: 2)} s", r.at(500100.0, 1600100.0).isFinite)
+    failed
+}

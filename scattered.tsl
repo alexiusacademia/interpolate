@@ -1,0 +1,627 @@
+// interpolate: surfaces through scattered points, such as boreholes,
+// survey shots, piezometers or rain gauges: values at points that don't
+// sit on a grid. Four ways to fill in between:
+//   tin      flat on the triangles of a Delaunay triangulation (SciPy's
+//            griddata "linear"): exact at the points, never overshoots
+//   nearest  the value of the nearest point (griddata "nearest")
+//   idw      inverse distance weighting: nearer points count more
+//   rbf      a smooth surface of radial basis functions, thin-plate spline
+//            by default (SciPy's RBFInterpolator)
+//
+// Author: Alexius Academia
+// Date: 2026-10-30
+
+// What a surface made by tin() gives outside the points' outline.
+public enum Beyond {
+    // NaN: no value there (as SciPy's griddata gives).
+    nan
+    // The value of the nearest point.
+    nearest
+}
+
+// The way a surface fills in between its points.
+public enum Method {
+    tin
+    nearest
+    idw
+    rbf
+}
+
+// The radial basis functions of rbf(), as SciPy names them. r is the
+// distance between two points (times `epsilon` for the last four).
+public enum Kernel {
+    // r² log r: the bending of a thin plate. The usual choice.
+    thinPlate
+    // -r
+    linear
+    // r³
+    cubic
+    // -r⁵
+    quintic
+    // -√(1 + r²)
+    multiquadric
+    // 1 / √(1 + r²)
+    inverseMultiquadric
+    // 1 / (1 + r²)
+    inverseQuadratic
+    // e^(-r²)
+    gaussian
+}
+
+// A k-d tree of points, for the nearest ones. The points are in `order`,
+// split in halves by x and y in turn: the middle of a range is the node,
+// the halves before and after it its two sides.
+struct PointTree {
+    xs: [Float]
+    ys: [Float]
+    order: [Int] = []
+
+    fn build(_ lo: Int, _ hi: Int, _ depth: Int) {
+        if hi - lo <= 1 {
+            return
+        }
+        let byX = depth % 2 == 0
+        let part = order.slice(from: lo, to: hi).sorted { a, b in
+            if byX { xs[a] < xs[b] || (xs[a] == xs[b] && ys[a] < ys[b]) } else { ys[a] < ys[b] || (ys[a] == ys[b] && xs[a] < xs[b]) }
+        }
+        for k in 0..part.count {
+            order[lo + k] = part[k]
+        }
+        let mid = (lo + hi) / 2
+        build(lo, mid, depth + 1)
+        build(mid + 1, hi, depth + 1)
+    }
+
+    // The nearest point to (x, y) in the range lo..hi, better than (best,
+    // bestD2): gives the point and its squared distance.
+    fn nearestIn(_ x: Float, _ y: Float, _ lo: Int, _ hi: Int, _ depth: Int, _ best: Int, _ bestD2: Float) -> (Int, Float) {
+        if hi <= lo {
+            return (best, bestD2)
+        }
+        let mid = (lo + hi) / 2
+        let p = order[mid]
+        var b = best
+        var bd = bestD2
+        let d2 = (xs[p] - x) * (xs[p] - x) + (ys[p] - y) * (ys[p] - y)
+        if d2 < bd || (d2 == bd && p < b) {
+            b = p
+            bd = d2
+        }
+        let diff = if depth % 2 == 0 { x - xs[p] } else { y - ys[p] }
+        let (nearLo, nearHi, farLo, farHi) = if diff < 0.0 { (lo, mid, mid + 1, hi) } else { (mid + 1, hi, lo, mid) }
+        let (b1, d1) = nearestIn(x, y, nearLo, nearHi, depth + 1, b, bd)
+        b = b1
+        bd = d1
+        if diff * diff <= bd {
+            let (b2, d2b) = nearestIn(x, y, farLo, farHi, depth + 1, b, bd)
+            b = b2
+            bd = d2b
+        }
+        (b, bd)
+    }
+
+    fn nearest(_ x: Float, _ y: Float) -> Int {
+        let (b, _) = nearestIn(x, y, 0, order.count, 0, -1, 1.0 / 0.0)
+        b
+    }
+
+    // The points within distance √r2 of (x, y), added to `found`.
+    fn within(_ x: Float, _ y: Float, _ r2: Float, _ lo: Int, _ hi: Int, _ depth: Int, _ found: [Int]) -> [Int] {
+        if hi <= lo {
+            return found
+        }
+        var out = found
+        let mid = (lo + hi) / 2
+        let p = order[mid]
+        if (xs[p] - x) * (xs[p] - x) + (ys[p] - y) * (ys[p] - y) <= r2 {
+            out.append(p)
+        }
+        let diff = if depth % 2 == 0 { x - xs[p] } else { y - ys[p] }
+        if diff <= 0.0 || diff * diff <= r2 {
+            out = within(x, y, r2, lo, mid, depth + 1, out)
+        }
+        if diff >= 0.0 || diff * diff <= r2 {
+            out = within(x, y, r2, mid + 1, hi, depth + 1, out)
+        }
+        out
+    }
+
+    // The k nearest points to (x, y), nearest first.
+    fn nearestK(_ x: Float, _ y: Float, _ k: Int) -> [Int] {
+        // Grow a circle until it holds k points.
+        let n = order.count
+        if k >= n {
+            return order.sorted { a, b in dist2(a, x, y) < dist2(b, x, y) || (dist2(a, x, y) == dist2(b, x, y) && a < b) }
+        }
+        let first = nearest(x, y)
+        var r2 = max(dist2(first, x, y), 1e-300)
+        var found: [Int] = []
+        var tries = 0
+        while tries < 2000 {
+            tries += 1
+            found = within(x, y, r2, 0, n, 0, [])
+            if found.count >= k {
+                break
+            }
+            r2 = if r2 == 0.0 { 1e-300 } else { r2 * 4.0 }
+        }
+        let sorted = found.sorted { a, b in dist2(a, x, y) < dist2(b, x, y) || (dist2(a, x, y) == dist2(b, x, y) && a < b) }
+        sorted.prefix(k)
+    }
+
+    fn dist2(_ p: Int, _ x: Float, _ y: Float) -> Float {
+        (xs[p] - x) * (xs[p] - x) + (ys[p] - y) * (ys[p] - y)
+    }
+}
+
+fn pointTree(_ xs: [Float], _ ys: [Float]) -> PointTree {
+    var order: [Int] = []
+    for k in 0..xs.count {
+        order.append(k)
+    }
+    var t = PointTree(xs: xs, ys: ys, order: order)
+    t.build(0, xs.count, 0)
+    t
+}
+
+// surface:
+//   Values through scattered points. Make one with tin(), nearest(),
+//   idw() or rbf(); then at(x, y) gives the value anywhere. Points at the
+//   same place are merged into one, with the mean of their values.
+public struct Surface {
+    method: Method
+    // The points, merged.
+    xs: [Float]
+    ys: [Float]
+    zs: [Float]
+    triangulation: Triangulation
+    beyond: Beyond = .nan
+    // Inverse distance weighting.
+    power: Float = 2.0
+    radius: Float = 0.0
+    neighbours: Int = 0
+    // Radial basis functions.
+    kernel: Kernel = .thinPlate
+    epsilon: Float = 1.0
+    degree: Int = 1
+    weights: [Float] = []
+    poly: [Float] = []
+    shiftX: Float = 0.0
+    shiftY: Float = 0.0
+    scaleX: Float = 1.0
+    scaleY: Float = 1.0
+    tree: PointTree
+
+    // at(x, y)
+    //   The value at (x, y). NaN where there's none: outside the outline
+    //   for tin() (unless `beyond: .nearest`), and beyond `radius` of every
+    //   point for idw().
+    fn at(_ x: Float, _ y: Float) -> Float {
+        if x.isNaN || y.isNaN {
+            return 0.0 / 0.0
+        }
+        match method {
+            .tin -> tinAt(x, y, 0)
+            .nearest -> zs[tree.nearest(x, y)]
+            .idw -> idwAt(x, y)
+            .rbf -> rbfAt(x, y)
+        }
+    }
+
+    // values(xs, ys)
+    //   The value at each pair (xs[k], ys[k]).
+    fn values(_ px: [Float], _ py: [Float]) -> [Float] {
+        if px.count != py.count {
+            fail("Surface.values: {px.count} x values but {py.count} y values")
+        }
+        var out: [Float] = []
+        var hint = 0
+        for (k, x) in px.enumerated() {
+            if method == .tin {
+                let t = triangulation.find(x, py[k], from: hint)
+                if t >= 0 {
+                    hint = t
+                }
+                out.append(tinAt(x, py[k], hint))
+            } else {
+                out.append(at(x, py[k]))
+            }
+        }
+        out
+    }
+
+    // onGrid(xs:, ys:)
+    //   The surface's values at every x and y of a grid, as a Grid (whose
+    //   at(x, y) reads between them): for contour plots, rasters and heat
+    //   maps. The xs and ys must each rise.
+    fn onGrid(xs: [Float], ys: [Float]) -> Grid {
+        let gx = xs
+        let gy = ys
+        var rows: [[Float]] = []
+        var hint = 0
+        for x in gx {
+            var row: [Float] = []
+            for y in gy {
+                if method == .tin {
+                    let t = triangulation.find(x, y, from: hint)
+                    if t >= 0 {
+                        hint = t
+                    }
+                    row.append(tinAt(x, y, hint))
+                } else {
+                    row.append(at(x, y))
+                }
+            }
+            rows.append(row)
+        }
+        grid(gx, gy, rows, outside: .nan)
+    }
+
+    // contours(levels)
+    //   The lines where the surface has each value in `levels`, for a
+    //   surface made by tin(): see interpolate.contours.
+    fn contours(_ levels: [Float]) -> [Contour] {
+        if method != .tin {
+            fail("Surface.contours: contours follow the triangles, so the surface must be made by tin(); for the others, use onGrid and draw the grid")
+        }
+        contourLines(triangulation, zs, levels)
+    }
+
+    fn tinAt(_ x: Float, _ y: Float, _ hint: Int) -> Float {
+        let t = triangulation.find(x, y, from: hint)
+        if t < 0 {
+            if beyond == .nearest {
+                return zs[tree.nearest(x, y)]
+            }
+            return 0.0 / 0.0
+        }
+        let (a, b, c) = triangulation.triangle(t)
+        let area = orient(xs[a], ys[a], xs[b], ys[b], xs[c], ys[c])
+        let wa = orient(xs[b], ys[b], xs[c], ys[c], x, y) / area
+        let wb = orient(xs[c], ys[c], xs[a], ys[a], x, y) / area
+        let wc = 1.0 - wa - wb
+        wa * zs[a] + wb * zs[b] + wc * zs[c]
+    }
+
+    fn idwAt(_ x: Float, _ y: Float) -> Float {
+        var near: [Int] = []
+        if radius > 0.0 {
+            near = tree.within(x, y, radius * radius, 0, xs.count, 0, [])
+            if neighbours > 0 && near.count > neighbours {
+                near = near.sorted { a, b in tree.dist2(a, x, y) < tree.dist2(b, x, y) || (tree.dist2(a, x, y) == tree.dist2(b, x, y) && a < b) }.prefix(neighbours)
+            }
+        } else if neighbours > 0 {
+            near = tree.nearestK(x, y, neighbours)
+        } else {
+            for k in 0..xs.count {
+                near.append(k)
+            }
+        }
+        if near.isEmpty {
+            return 0.0 / 0.0
+        }
+        var sw = 0.0
+        var swz = 0.0
+        for p in near {
+            let d2 = tree.dist2(p, x, y)
+            if d2 == 0.0 {
+                return zs[p]
+            }
+            let w = 1.0 / pow(d2, power / 2.0)
+            sw += w
+            swz += w * zs[p]
+        }
+        swz / sw
+    }
+
+    fn rbfAt(_ x: Float, _ y: Float) -> Float {
+        var v = 0.0
+        for k in 0..xs.count {
+            let dx = (x - xs[k]) * epsilon
+            let dy = (y - ys[k]) * epsilon
+            v += weights[k] * kernelValue(kernel, sqrt(dx * dx + dy * dy))
+        }
+        let terms = monomials((x - shiftX) / scaleX, (y - shiftY) / scaleY, degree)
+        for (k, m) in terms.enumerated() {
+            v += poly[k] * m
+        }
+        v
+    }
+}
+
+// φ(r) for a kernel.
+fn kernelValue(_ kernel: Kernel, _ r: Float) -> Float {
+    match kernel {
+        .thinPlate -> if r == 0.0 { 0.0 } else { r * r * log(r) }
+        .linear -> -r
+        .cubic -> r * r * r
+        .quintic -> -(r * r * r * r * r)
+        .multiquadric -> -sqrt(1.0 + r * r)
+        .inverseMultiquadric -> 1.0 / sqrt(1.0 + r * r)
+        .inverseQuadratic -> 1.0 / (1.0 + r * r)
+        .gaussian -> exp(-r * r)
+    }
+}
+
+// The polynomial terms up to `degree` at (u, v): 1, u, v, u², uv, v², …
+fn monomials(_ u: Float, _ v: Float, _ degree: Int) -> [Float] {
+    var out: [Float] = []
+    if degree < 0 {
+        return out
+    }
+    for d in 0..(degree + 1) {
+        for j in 0..(d + 1) {
+            out.append(pow(u, Float(d - j)) * pow(v, Float(j)))
+        }
+    }
+    out
+}
+
+// The smallest polynomial degree a kernel needs (SciPy's), or -1.
+fn minDegree(_ kernel: Kernel) -> Int {
+    match kernel {
+        .multiquadric -> 0
+        .linear -> 0
+        .thinPlate -> 1
+        .cubic -> 1
+        .quintic -> 2
+        _ -> -1
+    }
+}
+
+fn kernelName(_ kernel: Kernel) -> String {
+    match kernel {
+        .thinPlate -> "thinPlate"
+        .linear -> "linear"
+        .cubic -> "cubic"
+        .quintic -> "quintic"
+        .multiquadric -> "multiquadric"
+        .inverseMultiquadric -> "inverseMultiquadric"
+        .inverseQuadratic -> "inverseQuadratic"
+        .gaussian -> "gaussian"
+    }
+}
+
+// scatteredProblem(xs, ys, zs)
+//   What's wrong with scattered points before making a surface of them
+//   (nil if nothing): counts that differ, no points, or a value that isn't
+//   an ordinary number. tin() also needs 3 points not in a line.
+public fn scatteredProblem(_ xs: [Float], _ ys: [Float], _ zs: [Float]) -> String? {
+    if xs.count != ys.count || xs.count != zs.count {
+        return "there are {xs.count} x values, {ys.count} y values and {zs.count} values"
+    }
+    if xs.isEmpty {
+        return "there are no points"
+    }
+    for k in 0..xs.count {
+        if !xs[k].isFinite || !ys[k].isFinite {
+            return "point {k + 1} is ({xs[k]}, {ys[k]})"
+        }
+        if !zs[k].isFinite {
+            return "the value at point {k + 1} is {zs[k]}"
+        }
+    }
+    nil
+}
+
+// The points with those at one place merged (mean value), checked.
+fn mergedPoints(_ xs: [Float], _ ys: [Float], _ zs: [Float], _ what: String) -> ([Float], [Float], [Float]) {
+    if let p = scatteredProblem(xs, ys, zs) {
+        fail("{what}: {p}")
+    }
+    var at: [String: Int] = [:]
+    var mx: [Float] = []
+    var my: [Float] = []
+    var sum: [Float] = []
+    var count: [Float] = []
+    for k in 0..xs.count {
+        let key = "{xs[k]},{ys[k]}"
+        if let j = at[key] {
+            sum[j] += zs[k]
+            count[j] += 1.0
+        } else {
+            at[key] = mx.count
+            mx.append(xs[k])
+            my.append(ys[k])
+            sum.append(zs[k])
+            count.append(1.0)
+        }
+    }
+    var mz: [Float] = []
+    for j in 0..mx.count {
+        mz.append(sum[j] / count[j])
+    }
+    (mx, my, mz)
+}
+
+// tin(xs, ys, zs, beyond:)
+//   A surface flat on each triangle of the points' Delaunay triangulation,
+//   as a TIN ground model is (SciPy's griddata "linear"). It goes through
+//   every point and never goes above or below them. Outside the outline
+//   it's NaN, or with `beyond: .nearest`, the nearest point's value. It
+//   needs 3 points that aren't in a line.
+//
+//   let ground = interpolate.tin([0, 10, 0, 10], [0, 0, 10, 10], [5, 6, 7, 9])
+//   print(ground.at(2, 3))        // 5.8
+public fn tin(_ xs: [Float], _ ys: [Float], _ zs: [Float], beyond: Beyond = .nan) -> Surface {
+    let (mx, my, mz) = mergedPoints(xs, ys, zs, "tin")
+    let t = triangulate(mx, my)
+    if t.count() == 0 {
+        fail("tin: it needs at least 3 points that aren't in a line")
+    }
+    Surface(method: .tin, xs: mx, ys: my, zs: mz, triangulation: t, beyond: beyond, tree: pointTree(mx, my))
+}
+
+// nearest(xs, ys, zs)
+//   A surface with the value of the nearest point everywhere (SciPy's
+//   griddata "nearest"): for things that come in kinds, like soil types or
+//   zones, numbered.
+public fn nearest(_ xs: [Float], _ ys: [Float], _ zs: [Float]) -> Surface {
+    let (mx, my, mz) = mergedPoints(xs, ys, zs, "nearest")
+    Surface(method: .nearest, xs: mx, ys: my, zs: mz, triangulation: Triangulation(xs: [], ys: []), tree: pointTree(mx, my))
+}
+
+// idw(xs, ys, zs, power:, radius:, neighbours:)
+//   Inverse distance weighting: the mean of the points' values, each
+//   weighted by 1 / distance^power (2), so nearer points count more. At a
+//   point it's that point's value. With `radius`, only points that near
+//   count (NaN where there are none); with `neighbours`, only that many of
+//   the nearest. Common for rainfall and in GIS; it makes bull's-eyes
+//   round the points.
+public fn idw(_ xs: [Float], _ ys: [Float], _ zs: [Float], power: Float = 2.0, radius: Float = 0.0,
+              neighbours: Int = 0) -> Surface {
+    let (mx, my, mz) = mergedPoints(xs, ys, zs, "idw")
+    if !(power > 0.0) || !power.isFinite {
+        fail("idw: the power must be above 0, not {power}")
+    }
+    if radius < 0.0 || !radius.isFinite {
+        fail("idw: the radius must be 0 (no limit) or more, not {radius}")
+    }
+    if neighbours < 0 {
+        fail("idw: neighbours must be 0 (all) or more, not {neighbours}")
+    }
+    Surface(method: .idw, xs: mx, ys: my, zs: mz, triangulation: Triangulation(xs: [], ys: []), power: power,
+            radius: radius, neighbours: neighbours, tree: pointTree(mx, my))
+}
+
+// rbf(xs, ys, zs, kernel:, epsilon:, smoothing:, degree:)
+//   A smooth surface of radial basis functions through the points, as
+//   SciPy's RBFInterpolator makes it: a thin-plate spline by default, which
+//   bends as little as it can. It goes beyond the points and can overshoot
+//   them. `smoothing` above 0 lets it miss the points to be smoother (for
+//   noisy data). `epsilon` scales distances for the kernels that need it
+//   (multiquadric, inverseMultiquadric, inverseQuadratic, gaussian).
+//   `degree` is the added polynomial's (-1: the kernel's least, or none).
+//   It solves a system as big as the points, so keep to about 1000.
+public fn rbf(_ xs: [Float], _ ys: [Float], _ zs: [Float], kernel: Kernel = .thinPlate, epsilon: Float = 1.0,
+              smoothing: Float = 0.0, degree: Int = -2) -> Surface {
+    let (mx, my, mz) = mergedPoints(xs, ys, zs, "rbf")
+    let least = minDegree(kernel)
+    let deg = if degree == -2 { max(least, 0) } else { degree }
+    if deg < -1 || (deg > -1 && deg < least) {
+        fail("rbf: the {kernelName(kernel)} kernel needs a polynomial of degree {least} or more (or -1 for none), not {deg}")
+    }
+    if !(epsilon > 0.0) || !epsilon.isFinite {
+        fail("rbf: epsilon must be above 0, not {epsilon}")
+    }
+    if smoothing < 0.0 || !smoothing.isFinite {
+        fail("rbf: smoothing must be 0 or more, not {smoothing}")
+    }
+    let n = mx.count
+    // The polynomial is in shifted, scaled coordinates, as SciPy does, so
+    // the system stays well behaved far from the origin.
+    var minX = mx[0]
+    var maxX = mx[0]
+    var minY = my[0]
+    var maxY = my[0]
+    for k in 0..n {
+        minX = min(minX, mx[k])
+        maxX = max(maxX, mx[k])
+        minY = min(minY, my[k])
+        maxY = max(maxY, my[k])
+    }
+    let shiftX = (minX + maxX) / 2.0
+    let shiftY = (minY + maxY) / 2.0
+    let scaleX = if maxX > minX { (maxX - minX) / 2.0 } else { 1.0 }
+    let scaleY = if maxY > minY { (maxY - minY) / 2.0 } else { 1.0 }
+    let m = monomials(0.0, 0.0, deg).count
+    if n < m {
+        fail("rbf: a polynomial of degree {deg} needs at least {m} points, not {n}")
+    }
+    let size = n + m
+    var a: [[Float]] = []
+    var rhs: [Float] = []
+    for i in 0..size {
+        var row: [Float] = []
+        for j in 0..size {
+            row.append(0.0)
+        }
+        a.append(row)
+        rhs.append(if i < n { mz[i] } else { 0.0 })
+    }
+    for i in 0..n {
+        for j in 0..n {
+            let dx = (mx[i] - mx[j]) * epsilon
+            let dy = (my[i] - my[j]) * epsilon
+            a[i][j] = kernelValue(kernel, sqrt(dx * dx + dy * dy))
+        }
+        a[i][i] += smoothing
+        let terms = monomials((mx[i] - shiftX) / scaleX, (my[i] - shiftY) / scaleY, deg)
+        for (k, t) in terms.enumerated() {
+            a[i][n + k] = t
+            a[n + k][i] = t
+        }
+    }
+    let solution = solveDense(a, rhs)
+    if solution.isEmpty {
+        fail("rbf: the system can't be solved: are there points in a line with a polynomial of degree {deg}, or too few points?")
+    }
+    var w: [Float] = []
+    var pc: [Float] = []
+    for k in 0..size {
+        if k < n { w.append(solution[k]) } else { pc.append(solution[k]) }
+    }
+    Surface(method: .rbf, xs: mx, ys: my, zs: mz, triangulation: Triangulation(xs: [], ys: []), kernel: kernel,
+            epsilon: epsilon, degree: deg, weights: w, poly: pc, shiftX: shiftX, shiftY: shiftY, scaleX: scaleX,
+            scaleY: scaleY, tree: pointTree(mx, my))
+}
+
+// Solves a x = b by Gaussian elimination with partial pivoting; [] when a
+// is singular.
+fn solveDense(_ a0: [[Float]], _ b0: [Float]) -> [Float] {
+    var a = a0
+    var b = b0
+    let n = b.count
+    for col in 0..n {
+        var piv = col
+        var best = abs(a[col][col])
+        for r in (col + 1)..n {
+            if abs(a[r][col]) > best {
+                best = abs(a[r][col])
+                piv = r
+            }
+        }
+        if best == 0.0 || !best.isFinite {
+            return []
+        }
+        if piv != col {
+            let tr = a[piv]
+            a[piv] = a[col]
+            a[col] = tr
+            let tb = b[piv]
+            b[piv] = b[col]
+            b[col] = tb
+        }
+        let pivotRow = a[col]
+        let p = pivotRow[col]
+        for r in (col + 1)..n {
+            let f = a[r][col] / p
+            if f != 0.0 {
+                var row = a[r]
+                for c in col..n {
+                    row[c] -= f * pivotRow[c]
+                }
+                a[r] = row
+                b[r] -= f * b[col]
+            }
+        }
+    }
+    var x: [Float] = []
+    for _ in 0..n {
+        x.append(0.0)
+    }
+    var i = n - 1
+    while i >= 0 {
+        var s = b[i]
+        let row = a[i]
+        for c in (i + 1)..n {
+            s -= row[c] * x[c]
+        }
+        x[i] = s / row[i]
+        if !x[i].isFinite {
+            return []
+        }
+        i -= 1
+    }
+    x
+}

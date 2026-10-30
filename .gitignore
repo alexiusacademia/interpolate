@@ -3,3 +3,7 @@
 /interpolate.exe
 *.app/
 .DS_Store
+
+# Python for tools/oracle.
+.venv/
+__pycache__/

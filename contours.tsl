@@ -1,0 +1,175 @@
+// interpolate: contour lines on a triangulation: the lines where a surface
+// that's flat on each triangle has a given value, as contours are drawn
+// from survey points. Each line is followed from triangle to triangle, so
+// it comes out whole: open where it meets the outline, closed round a hill
+// or a hollow.
+//
+// Author: Alexius Academia
+// Date: 2026-10-30
+
+// contour:
+//   One contour line: its level, its points (x, y, x, y, …), and whether
+//   it's closed (the last point joins the first, which isn't repeated).
+//   Walking along it, higher ground is on the left.
+public struct Contour {
+    level: Float
+    points: [Float]
+    closed: Bool
+}
+
+// A piece of a contour line across one triangle: from a point on one edge
+// to a point on another. The edges are named by their lower halfedge.
+struct Piece {
+    from: Int
+    to: Int
+    x0: Float
+    y0: Float
+    x1: Float
+    y1: Float
+}
+
+// The name of an edge: the lower of its two halfedges.
+fn edgeName(_ t: Triangulation, _ e: Int) -> Int {
+    let twin = t.halfedges[e]
+    if twin >= 0 && twin < e { twin } else { e }
+}
+
+// Where the level crosses edge e, from its first point to its second.
+fn crossing(_ t: Triangulation, _ zs: [Float], _ e: Int, _ level: Float) -> (Float, Float) {
+    let a = t.triangles[e]
+    let b = t.triangles[nextEdge(e)]
+    let f = (level - zs[a]) / (zs[b] - zs[a])
+    (t.xs[a] + (t.xs[b] - t.xs[a]) * f, t.ys[a] + (t.ys[b] - t.ys[a]) * f)
+}
+
+// The pieces of the line at `level`, one for each triangle it crosses.
+// A point at exactly the level counts as above it.
+fn pieces(_ t: Triangulation, _ zs: [Float], _ level: Float) -> [Piece] {
+    var out: [Piece] = []
+    for k in 0..t.count() {
+        // The cut edges: one whose first point is above (the line starts
+        // there, with higher ground on its left) and one whose first point
+        // is below (it ends there).
+        var start = -1
+        var end = -1
+        for j in 0..3 {
+            let e = 3 * k + j
+            let za = zs[t.triangles[e]] >= level
+            let zb = zs[t.triangles[nextEdge(e)]] >= level
+            if za && !zb {
+                start = e
+            } else if !za && zb {
+                end = e
+            }
+        }
+        if start < 0 || end < 0 {
+            continue
+        }
+        let (x0, y0) = crossing(t, zs, start, level)
+        let (x1, y1) = crossing(t, zs, end, level)
+        out.append(Piece(from: edgeName(t, start), to: edgeName(t, end), x0: x0, y0: y0, x1: x1, y1: y1))
+    }
+    out
+}
+
+// The contour lines at one level.
+fn linesAt(_ t: Triangulation, _ zs: [Float], _ level: Float) -> [Contour] {
+    let ps = pieces(t, zs, level)
+    // Which piece starts at each edge, and which edges a piece ends at.
+    var startsAt: [Int: Int] = [:]
+    var endsAt: Set<Int> = []
+    for (k, p) in ps.enumerated() {
+        startsAt[p.from] = k
+        endsAt.insert(p.to)
+    }
+    var done: [Bool] = []
+    for _ in 0..ps.count {
+        done.append(false)
+    }
+    var out: [Contour] = []
+    // Open lines first: those starting at an edge no piece ends at (the
+    // outline), then the closed ones that are left.
+    for pass in 0..2 {
+        for k in 0..ps.count {
+            if done[k] || (pass == 0 && endsAt.contains(ps[k].from)) {
+                continue
+            }
+            var pts: [Float] = [ps[k].x0, ps[k].y0]
+            var cur = k
+            var closed = false
+            while true {
+                done[cur] = true
+                let p = ps[cur]
+                if let next = startsAt[p.to] {
+                    if next == k {
+                        closed = true
+                        break
+                    }
+                    if done[next] {
+                        pts.append(p.x1)
+                        pts.append(p.y1)
+                        break
+                    }
+                    pts.append(p.x1)
+                    pts.append(p.y1)
+                    cur = next
+                } else {
+                    pts.append(p.x1)
+                    pts.append(p.y1)
+                    break
+                }
+            }
+            out.append(Contour(level: level, points: pts, closed: closed))
+        }
+    }
+    out
+}
+
+fn contourLines(_ t: Triangulation, _ zs: [Float], _ levels: [Float]) -> [Contour] {
+    var out: [Contour] = []
+    for level in levels {
+        if !level.isFinite {
+            fail("contours: a level is {level}")
+        }
+        out.appendAll(linesAt(t, zs, level))
+    }
+    out
+}
+
+// contours(t, zs, levels:)
+//   The contour lines of the surface that's flat on each of t's triangles,
+//   with value zs[k] at point k: for each level, every line where the
+//   surface has that value. Walking along a line, higher ground is on the
+//   left.
+//
+//   let t = interpolate.triangulate(xs, ys)
+//   for c in interpolate.contours(t, zs, levels: [100, 105, 110]) {
+//       g.lines(c.points, closed: c.closed)
+//   }
+public fn contours(_ t: Triangulation, _ zs: [Float], levels: [Float]) -> [Contour] {
+    if zs.count != t.xs.count {
+        fail("contours: there are {t.xs.count} points but {zs.count} values")
+    }
+    for (k, z) in zs.enumerated() {
+        if !z.isFinite && t.used[k] {
+            fail("contours: the value at point {k + 1} is {z}")
+        }
+    }
+    contourLines(t, zs, levels)
+}
+
+// levelsBetween(low, high, step:)
+//   The round levels from low to high, `step` apart: levelsBetween(97.3,
+//   112, step: 5) is 100, 105, 110.
+public fn levelsBetween(_ low: Float, _ high: Float, step: Float) -> [Float] {
+    if !(step > 0.0) || !step.isFinite || !low.isFinite || !high.isFinite {
+        fail("levelsBetween: the step must be above 0 and the ends ordinary numbers")
+    }
+    var out: [Float] = []
+    var k = ceil(low / step)
+    while k * step <= high + 1e-9 * step && out.count < 100000 {
+        out.append(k * step)
+        k += 1.0
+    }
+    out
+}
